@@ -10,3 +10,10 @@ paddleocr
 torch
 torchvision
 streamlit-option-menu
+streamlit
+opencv-python-headless
+numpy
+Pillow
+pandas
+plotly
+altair
