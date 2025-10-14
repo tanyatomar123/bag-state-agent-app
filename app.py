@@ -1,18 +1,22 @@
 import streamlit as st
+import cv2
 import numpy as np
 import time
 import logging
 from enum import Enum, auto
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 from datetime import datetime
 import pandas as pd
 import plotly.express as px
-from PIL import Image, ImageDraw, ImageFont
-import random
+from PIL import Image
 import json
-import io
-import base64
+import tempfile
+import os
+from pathlib import Path
+import asyncio
+import queue
+import threading
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,30 +24,31 @@ logger = logging.getLogger(__name__)
 
 # Set page config
 st.set_page_config(
-    page_title="Bag Detection AI Agent",
+    page_title="Bag Detection Pipeline Agent",
     page_icon="🛍️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 class AgentState(Enum):
-    """State machine states"""
+    """State machine states for the bag detection pipeline"""
     IDLE = auto()
     WAITING_FIRST_BAG = auto()
     FIRST_BAG_DETECTED = auto()
-    PROCESSING_OCR = auto()
+    PROCESSING_FIRST_OCR = auto()
     TRACKING_BAGS = auto()
     WAITING_LAST_BAG = auto()
     LAST_BAG_DETECTED = auto()
-    ERROR = auto()
+    PROCESSING_LAST_OCR = auto()
     COMPLETED = auto()
+    ERROR = auto()
 
 @dataclass
 class BagDetection:
-    """Data class for bag detection results"""
+    """Bag detection result from YOLO"""
     bag_id: str
     confidence: float
-    bbox: tuple
+    bbox: Tuple[int, int, int, int]  # (x1, y1, x2, y2)
     timestamp: datetime
     frame_id: int
     class_id: int = 0
@@ -51,709 +56,890 @@ class BagDetection:
 
 @dataclass
 class OCRResult:
-    """Data class for OCR results"""
+    """OCR extraction result"""
     barcode: str
     confidence: float
-    text_data: Dict[str, Any]
     timestamp: datetime
     bag_id: str
-    bbox: Optional[tuple] = None
+    bbox: Tuple[int, int, int, int]
+    is_first_bag: bool = False
+    is_last_bag: bool = False
 
 @dataclass
-class AgentContext:
-    """Context data shared across states"""
+class PipelineContext:
+    """Context for the entire pipeline"""
     first_bag: Optional[BagDetection] = None
     last_bag: Optional[BagDetection] = None
+    first_barcode: Optional[str] = None
+    last_barcode: Optional[str] = None
+    all_detections: List[BagDetection] = field(default_factory=list)
     ocr_results: List[OCRResult] = field(default_factory=list)
-    bag_count: int = 0
-    frames_without_detection: int = 0
-    error_message: Optional[str] = None
+    total_bags: int = 0
+    frames_without_bag: int = 0
     session_id: str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d_%H%M%S"))
-    last_detection_time: Optional[datetime] = None
+    error_message: Optional[str] = None
+    pipeline_start_time: Optional[datetime] = None
 
-    def to_dict(self) -> Dict:
-        """Convert context to dictionary for logging/export"""
-        return {
-            "session_id": self.session_id,
-            "first_bag": {
-                "bag_id": self.first_bag.bag_id,
-                "timestamp": self.first_bag.timestamp.isoformat(),
-                "confidence": self.first_bag.confidence,
-                "bbox": self.first_bag.bbox
-            } if self.first_bag else None,
-            "last_bag": {
-                "bag_id": self.last_bag.bag_id,
-                "timestamp": self.last_bag.timestamp.isoformat(),
-                "confidence": self.last_bag.confidence,
-                "bbox": self.last_bag.bbox
-            } if self.last_bag else None,
-            "bag_count": self.bag_count,
-            "ocr_results": [
-                {
-                    "barcode": r.barcode,
-                    "confidence": r.confidence,
-                    "timestamp": r.timestamp.isoformat(),
-                    "bag_id": r.bag_id
-                } for r in self.ocr_results
-            ]
-        }
-
-class OCRSimulator:
-    """OCR simulator with model upload capability"""
+class StapipySimulator:
+    """Simulates Stapipy frame grabbing"""
     
-    def __init__(self):
-        self.simulated_barcodes = [
-            "123456789012", "987654321098", "456123789045",
-            "321654987012", "789012345678", "210987654321",
-            "345678901234", "876543210987", "234567890123"
-        ]
-        self.custom_model_loaded = False
-        self.model_name = "Default Simulator"
-    
-    def load_custom_model(self, uploaded_file):
-        """Simulate loading a custom model"""
-        try:
-            # In a real implementation, this would load your actual model
-            # For simulation, we'll just mark that a custom model is loaded
-            self.custom_model_loaded = True
-            self.model_name = uploaded_file.name
-            return True
-        except Exception as e:
-            st.error(f"Error loading model: {e}")
-            return False
-    
-    def extract_barcode(self, image: np.ndarray, bbox: Optional[tuple] = None) -> Optional[str]:
-        """Extract barcode from image region"""
-        # Simulate better performance with custom model
-        success_rate = 0.8 if self.custom_model_loaded else 0.6
-        
-        if random.random() > (1 - success_rate):
-            barcode = random.choice(self.simulated_barcodes)
-            
-            # Add some realism - custom models might have different output
-            if self.custom_model_loaded:
-                # Simulate custom model behavior
-                if random.random() > 0.1:  # 90% confidence with custom model
-                    return barcode
-            else:
-                # Default simulator behavior
-                if random.random() > 0.3:  # 70% confidence with default
-                    return barcode
-        
-        return None
-
-class StateMachineAgent:
-    """
-    Production-ready state machine agent for bag detection pipeline
-    """
-
-    def __init__(self, config: Optional[Dict] = None):
-        self.state = AgentState.IDLE
-        self.context = AgentContext()
-
-        # Configuration
-        self.config = config or {}
-        self.last_bag_timeout = self.config.get('last_bag_timeout', 5.0)
-        self.min_confidence = self.config.get('min_confidence', 0.5)
-        self.max_no_detection_frames = self.config.get('max_no_detection_frames', 150)
-        self.process_all_bags = self.config.get('process_all_bags', True)
-
-        # OCR engine
-        self.ocr_engine = OCRSimulator()
-
-        # Runtime tracking
-        self.last_bag_candidate: Optional[BagDetection] = None
-        self.current_frame: Optional[np.ndarray] = None
+    def __init__(self, source_type: str = "webcam", video_path: Optional[str] = None):
+        self.source_type = source_type
+        self.video_path = video_path
         self.frame_count = 0
-        self.state_history = []
+        self.cap = None
+        self._initialize_source()
+    
+    def _initialize_source(self):
+        """Initialize video source"""
+        try:
+            if self.source_type == "webcam":
+                self.cap = cv2.VideoCapture(0)
+            elif self.source_type == "video_file" and self.video_path:
+                self.cap = cv2.VideoCapture(self.video_path)
+            else:
+                # Create synthetic frames
+                self.cap = None
+        except Exception as e:
+            logger.warning(f"Could not initialize video source: {e}")
+            self.cap = None
+    
+    def get_frame(self) -> Optional[Dict]:
+        """Get next frame from source"""
+        try:
+            if self.cap and self.cap.isOpened():
+                ret, frame = self.cap.read()
+                if ret:
+                    self.frame_count += 1
+                    return {
+                        'frame': frame,
+                        'frame_id': self.frame_count,
+                        'timestamp': datetime.now(),
+                        'source': 'stapipy'
+                    }
+                else:
+                    # Loop video or restart webcam
+                    if self.source_type == "video_file":
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        return self.get_frame()
+                    return None
+            else:
+                # Generate synthetic frame
+                return self._generate_synthetic_frame()
+                
+        except Exception as e:
+            logger.error(f"Frame capture error: {e}")
+            return None
+    
+    def _generate_synthetic_frame(self) -> Dict:
+        """Generate synthetic conveyor belt frame"""
+        self.frame_count += 1
+        
+        # Create a realistic conveyor belt frame
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        frame[:,:] = (50, 50, 50)  # Dark gray background
+        
+        # Draw conveyor belt
+        belt_y1, belt_y2 = 150, 330
+        cv2.rectangle(frame, (50, belt_y1), (590, belt_y2), (100, 100, 100), -1)
+        cv2.rectangle(frame, (50, belt_y1), (590, belt_y2), (150, 150, 150), 2)
+        
+        # Draw moving elements based on frame count
+        x_pos = (self.frame_count * 3) % 600
+        
+        # Occasionally add bags
+        if random.random() > 0.4:  # 60% chance of bag
+            bag_width, bag_height = 80, 120
+            bag_x = 50 + x_pos
+            bag_y = belt_y1 + 10
+            
+            # Draw bag
+            cv2.rectangle(frame, (bag_x, bag_y), (bag_x + bag_width, bag_y + bag_height), 
+                         (0, 100, 200), -1)
+            cv2.rectangle(frame, (bag_x, bag_y), (bag_x + bag_width, bag_y + bag_height), 
+                         (255, 255, 255), 2)
+            
+            # Draw barcode area
+            barcode_y = bag_y + bag_height - 25
+            cv2.rectangle(frame, (bag_x + 10, barcode_y), (bag_x + bag_width - 10, bag_y + bag_height - 5), 
+                         (255, 255, 255), -1)
+            # Simulate barcode lines
+            for i in range(bag_x + 15, bag_x + bag_width - 15, 5):
+                if random.random() > 0.3:
+                    cv2.line(frame, (i, barcode_y), (i, bag_y + bag_height - 10), (0, 0, 0), 1)
+        
+        # Add text
+        cv2.putText(frame, "Conveyor Belt - Stapipy Stream", (150, 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"Frame: {self.frame_count}", (20, 430), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        return {
+            'frame': frame,
+            'frame_id': self.frame_count,
+            'timestamp': datetime.now(),
+            'source': 'synthetic'
+        }
+    
+    def release(self):
+        """Release resources"""
+        if self.cap:
+            self.cap.release()
 
-        logger.info(f"Agent initialized with session_id: {self.context.session_id}")
-
-    def simulate_detection(self, frame: np.ndarray) -> List[Dict]:
-        """Simulate object detection"""
-        height, width = frame.shape[1], frame.shape[0]  # PIL image dimensions
+class YOLODetector:
+    """YOLO detection wrapper"""
+    
+    def __init__(self, model_path: str = "yolov8n.pt", conf_threshold: float = 0.5):
+        self.model_path = model_path
+        self.conf_threshold = conf_threshold
+        self.model = None
+        self._load_model()
+    
+    def _load_model(self):
+        """Load YOLO model"""
+        try:
+            from ultralytics import YOLO
+            self.model = YOLO(self.model_path)
+            st.success(f"✅ YOLO model loaded: {self.model_path}")
+        except Exception as e:
+            st.warning(f"⚠️ YOLO not available, using simulation: {e}")
+            self.model = None
+    
+    def detect(self, frame: np.ndarray) -> List[Dict]:
+        """Detect objects in frame"""
+        if self.model is None:
+            return self._simulate_detection(frame)
+        
+        try:
+            results = self.model(frame, conf=self.conf_threshold, verbose=False)
+            detections = []
+            
+            for result in results:
+                if result.boxes is not None:
+                    for box in result.boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+                        conf = float(box.conf[0].cpu().numpy())
+                        cls = int(box.cls[0].cpu().numpy())
+                        
+                        class_name = result.names[cls] if hasattr(result, 'names') else "object"
+                        
+                        # Filter for bags/objects of interest
+                        if class_name in ["bag", "suitcase", "backpack", "handbag"] or conf > 0.5:
+                            detections.append({
+                                'bbox': (x1, y1, x2, y2),
+                                'confidence': conf,
+                                'class_id': cls,
+                                'class_name': class_name
+                            })
+            
+            return detections
+            
+        except Exception as e:
+            logger.error(f"YOLO detection error: {e}")
+            return self._simulate_detection(frame)
+    
+    def _simulate_detection(self, frame: np.ndarray) -> List[Dict]:
+        """Simulate bag detection"""
+        height, width = frame.shape[:2]
         detections = []
         
-        # More realistic detection simulation
-        detection_probability = 0.7
+        # Look for bag-like rectangles in the conveyor area
+        conveyor_region = frame[150:330, 50:590]  # Conveyor belt area
         
-        if random.random() < detection_probability:
-            num_bags = random.choices([1, 2, 3], weights=[0.6, 0.3, 0.1])[0]
-            
-            for i in range(num_bags):
-                w, h = random.randint(80, 200), random.randint(120, 300)
-                x1 = random.randint(50, width - w - 50)
-                y1 = random.randint(50, height - h - 50)
+        # Simple color-based detection for blue bags
+        blue_lower = np.array([100, 0, 0])
+        blue_upper = np.array([255, 100, 100])
+        blue_mask = cv2.inRange(conveyor_region, blue_lower, blue_upper)
+        
+        contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > 1000:  # Minimum bag size
+                x, y, w, h = cv2.boundingRect(contour)
+                # Convert to full frame coordinates
+                x_full = x + 50
+                y_full = y + 150
                 
                 detections.append({
-                    'bbox': (x1, y1, x1 + w, y1 + h),
-                    'confidence': random.uniform(0.7, 0.95),
+                    'bbox': (x_full, y_full, x_full + w, y_full + h),
+                    'confidence': min(0.9, area / 5000),  # Scale confidence by size
                     'class_id': 0,
-                    'class_name': "bag"
+                    'class_name': 'bag'
                 })
+        
+        # If no contours found, use random detection for demo
+        if not detections and random.random() > 0.6:
+            w, h = 80, 120
+            x = random.randint(50, width - w - 50)
+            y = random.randint(150, 330 - h)
+            
+            detections.append({
+                'bbox': (x, y, x + w, y + h),
+                'confidence': random.uniform(0.7, 0.95),
+                'class_id': 0,
+                'class_name': 'bag'
+            })
         
         return detections
 
-    def change_state(self, new_state: AgentState):
-        """Change agent state"""
+class OCREngine:
+    """OCR engine for barcode extraction"""
+    
+    def __init__(self, engine_type: str = "paddle", model_path: Optional[str] = None):
+        self.engine_type = engine_type
+        self.model_path = model_path
+        self.engine = None
+        self._load_engine()
+    
+    def _load_engine(self):
+        """Load OCR engine"""
+        try:
+            if self.engine_type == "paddle":
+                from paddleocr import PaddleOCR
+                self.engine = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+                st.success("✅ PaddleOCR engine loaded")
+            else:
+                st.warning("Using OCR simulation")
+                self.engine = None
+        except Exception as e:
+            st.warning(f"OCR engine not available: {e}")
+            self.engine = None
+    
+    def extract_barcode(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[str]:
+        """Extract barcode from bag region"""
+        if self.engine is None:
+            return self._simulate_barcode_extraction()
+        
+        try:
+            x1, y1, x2, y2 = bbox
+            roi = frame[y1:y2, x1:x2]
+            
+            if roi.size == 0:
+                return None
+            
+            # Convert to RGB for OCR
+            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+            
+            if self.engine_type == "paddle":
+                result = self.engine.ocr(roi_rgb, cls=True)
+                
+                if result and result[0]:
+                    texts = [line[1][0] for line in result[0]]
+                    barcode = self._find_barcode_pattern(texts)
+                    if barcode:
+                        return barcode
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"OCR extraction error: {e}")
+            return self._simulate_barcode_extraction()
+    
+    def _find_barcode_pattern(self, texts: List[str]) -> Optional[str]:
+        """Find barcode patterns in OCR results"""
+        import re
+        
+        barcode_patterns = [
+            r'\b\d{12,13}\b',      # EAN-13, UPC
+            r'\b\d{8}\b',          # EAN-8
+            r'\b[A-Z0-9]{8,15}\b', # Alphanumeric codes
+        ]
+        
+        for text in texts:
+            for pattern in barcode_patterns:
+                match = re.search(pattern, text.replace(' ', ''))
+                if match:
+                    return match.group(0)
+        
+        return None
+    
+    def _simulate_barcode_extraction(self) -> Optional[str]:
+        """Simulate barcode extraction"""
+        barcodes = [
+            "5901234123457", "9780201379624", "1234567890128",
+            "4006381333931", "3661112507010", "5449000000996",
+            "3017620422003", "7613032620033", "8000500310427"
+        ]
+        
+        # 70% success rate for simulation
+        if random.random() > 0.3:
+            return random.choice(barcodes)
+        return None
+
+class BagDetectionAgent:
+    """
+    Main agent that manages the complete pipeline:
+    1. Stapipy frame grabbing
+    2. YOLO bag detection  
+    3. OCR barcode extraction
+    4. State management for 1st/last bag detection
+    """
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.state = AgentState.IDLE
+        self.context = PipelineContext()
+        
+        # Pipeline components
+        self.stapipy = StapipySimulator(
+            source_type=config.get('source_type', 'synthetic'),
+            video_path=config.get('video_path')
+        )
+        self.yolo = YOLODetector(
+            model_path=config.get('yolo_model', 'yolov8n.pt'),
+            conf_threshold=config.get('confidence_threshold', 0.5)
+        )
+        self.ocr = OCREngine(
+            engine_type=config.get('ocr_engine', 'paddle')
+        )
+        
+        # State tracking
+        self.current_frame = None
+        self.processing_active = False
+        self.state_history = []
+        self.last_detection_time = None
+        
+        # Performance tracking
+        self.frame_count = 0
+        self.processing_times = []
+        
+        logger.info(f"BagDetectionAgent initialized with session: {self.context.session_id}")
+    
+    def start_pipeline(self):
+        """Start the processing pipeline"""
+        self.state = AgentState.WAITING_FIRST_BAG
+        self.context.pipeline_start_time = datetime.now()
+        self.processing_active = True
+        self.state_history.append(('START', self.state.name, datetime.now()))
+        
+        logger.info("Pipeline started - waiting for first bag")
+    
+    def stop_pipeline(self):
+        """Stop the processing pipeline"""
+        self.processing_active = False
+        self.stapipy.release()
+        logger.info("Pipeline stopped")
+    
+    def process_single_frame(self) -> bool:
+        """
+        Process a single frame through the complete pipeline
+        Returns True if processing should continue
+        """
+        if not self.processing_active:
+            return False
+        
+        start_time = time.time()
+        self.frame_count += 1
+        
+        try:
+            # 1. Stapipy Frame Grabbing
+            frame_data = self.stapipy.get_frame()
+            if frame_data is None:
+                logger.warning("No frame received from Stapipy")
+                return True
+            
+            self.current_frame = frame_data['frame']
+            
+            # 2. YOLO Detection
+            detections = self.yolo.detect(self.current_frame)
+            
+            # 3. State Management & OCR Processing
+            has_bag = len(detections) > 0
+            
+            if self.state == AgentState.WAITING_FIRST_BAG:
+                self._handle_waiting_first_bag(detections, frame_data)
+                
+            elif self.state == AgentState.FIRST_BAG_DETECTED:
+                self._handle_first_bag_detected()
+                
+            elif self.state == AgentState.TRACKING_BAGS:
+                self._handle_tracking_bags(detections, frame_data)
+                
+            elif self.state == AgentState.WAITING_LAST_BAG:
+                self._handle_waiting_last_bag(has_bag)
+            
+            # Track processing time
+            processing_time = time.time() - start_time
+            self.processing_times.append(processing_time)
+            
+            return self.state != AgentState.COMPLETED and self.state != AgentState.ERROR
+            
+        except Exception as e:
+            logger.error(f"Pipeline processing error: {e}")
+            self.context.error_message = str(e)
+            self._change_state(AgentState.ERROR)
+            return False
+    
+    def _handle_waiting_first_bag(self, detections: List[Dict], frame_data: Dict):
+        """Handle state: Waiting for first bag"""
+        if detections:
+            best_detection = max(detections, key=lambda x: x['confidence'])
+            
+            bag_detection = BagDetection(
+                bag_id="BAG_001",
+                confidence=best_detection['confidence'],
+                bbox=best_detection['bbox'],
+                timestamp=frame_data['timestamp'],
+                frame_id=frame_data['frame_id']
+            )
+            
+            self.context.first_bag = bag_detection
+            self.context.all_detections.append(bag_detection)
+            self.context.total_bags = 1
+            self.last_detection_time = datetime.now()
+            
+            self._change_state(AgentState.FIRST_BAG_DETECTED)
+            logger.info(f"First bag detected: {bag_detection.bag_id}")
+            
+            # Start OCR processing for first bag
+            self._process_bag_ocr(bag_detection, is_first=True)
+        
+        else:
+            self.context.frames_without_bag += 1
+    
+    def _handle_first_bag_detected(self):
+        """Handle state: First bag detected - wait for OCR completion"""
+        # Check if we have OCR result for first bag
+        first_bag_ocr = next((ocr for ocr in self.context.ocr_results 
+                            if ocr.is_first_bag), None)
+        
+        if first_bag_ocr:
+            self.context.first_barcode = first_bag_ocr.barcode
+            self._change_state(AgentState.TRACKING_BAGS)
+            logger.info(f"First barcode extracted: {first_bag_ocr.barcode}")
+    
+    def _handle_tracking_bags(self, detections: List[Dict], frame_data: Dict):
+        """Handle state: Tracking subsequent bags"""
+        if detections:
+            best_detection = max(detections, key=lambda x: x['confidence'])
+            
+            bag_detection = BagDetection(
+                bag_id=f"BAG_{self.context.total_bags + 1:03d}",
+                confidence=best_detection['confidence'],
+                bbox=best_detection['bbox'],
+                timestamp=frame_data['timestamp'],
+                frame_id=frame_data['frame_id']
+            )
+            
+            self.context.all_detections.append(bag_detection)
+            self.context.total_bags += 1
+            self.last_detection_time = datetime.now()
+            self.context.frames_without_bag = 0
+            
+            logger.info(f"Bag detected: {bag_detection.bag_id}")
+            
+            # Process OCR for this bag
+            self._process_bag_ocr(bag_detection, is_first=False)
+            
+        else:
+            self.context.frames_without_bag += 1
+            
+            # Check for last bag timeout
+            if self.last_detection_time:
+                timeout = self.config.get('last_bag_timeout', 5.0)
+                elapsed = (datetime.now() - self.last_detection_time).total_seconds()
+                
+                if elapsed >= timeout:
+                    self._change_state(AgentState.WAITING_LAST_BAG)
+                    logger.info(f"Last bag timeout reached: {elapsed:.1f}s")
+    
+    def _handle_waiting_last_bag(self, has_bag: bool):
+        """Handle state: Waiting for last bag confirmation"""
+        if has_bag:
+            # We have another bag - continue tracking
+            self._change_state(AgentState.TRACKING_BAGS)
+            self.context.frames_without_bag = 0
+        else:
+            self.context.frames_without_bag += 1
+            
+            # Wait for stable no-bag period
+            stable_frames = self.config.get('stable_frames', 10)
+            if self.context.frames_without_bag >= stable_frames:
+                # Set last bag and complete
+                if self.context.all_detections:
+                    self.context.last_bag = self.context.all_detections[-1]
+                    
+                    # Process last bag OCR if not already done
+                    last_bag_ocr = next((ocr for ocr in self.context.ocr_results 
+                                       if ocr.bag_id == self.context.last_bag.bag_id), None)
+                    
+                    if not last_bag_ocr:
+                        self._process_bag_ocr(self.context.last_bag, is_last=True)
+                    else:
+                        self.context.last_barcode = last_bag_ocr.barcode
+                        self._change_state(AgentState.COMPLETED)
+    
+    def _process_bag_ocr(self, bag_detection: BagDetection, is_first: bool = False, is_last: bool = False):
+        """Process OCR for a detected bag"""
+        if self.current_frame is None:
+            return
+        
+        barcode = self.ocr.extract_barcode(self.current_frame, bag_detection.bbox)
+        
+        if barcode:
+            ocr_result = OCRResult(
+                barcode=barcode,
+                confidence=0.9,  # Would come from OCR engine
+                timestamp=datetime.now(),
+                bag_id=bag_detection.bag_id,
+                bbox=bag_detection.bbox,
+                is_first_bag=is_first,
+                is_last_bag=is_last
+            )
+            
+            self.context.ocr_results.append(ocr_result)
+            
+            if is_first:
+                self.context.first_barcode = barcode
+            if is_last:
+                self.context.last_barcode = barcode
+                self._change_state(AgentState.COMPLETED)
+            
+            logger.info(f"OCR result: {barcode} for {bag_detection.bag_id}")
+    
+    def _change_state(self, new_state: AgentState):
+        """Change agent state with logging"""
         old_state = self.state
         self.state = new_state
-        self.state_history.append({
-            'old_state': old_state.name,
-            'new_state': new_state.name,
-            'timestamp': datetime.now()
-        })
-        logger.info(f"State transition: {old_state.name} -> {new_state.name}")
-
-    async def start(self):
-        """Start the agent"""
-        self.change_state(AgentState.WAITING_FIRST_BAG)
-        logger.info("Agent started - waiting for first bag")
-
-    async def process_frame(self, frame_data: Dict):
-        """
-        Main processing loop for each frame
-        """
-        try:
-            # Skip if not in active states
-            if self.state not in [
-                AgentState.WAITING_FIRST_BAG,
-                AgentState.TRACKING_BAGS
-            ]:
-                return
-
-            frame = frame_data['frame']
-            frame_id = frame_data['frame_id']
-            self.current_frame = frame
-            self.frame_count = frame_id
-
-            # Run detection
-            detections = self.simulate_detection(frame)
-
-            if detections:
-                # Filter by confidence and get best detection
-                valid_detections = [d for d in detections if d['confidence'] >= self.min_confidence]
-
-                if valid_detections:
-                    # Take detection with highest confidence
-                    best_detection = max(valid_detections, key=lambda x: x['confidence'])
-
-                    bag_detection = BagDetection(
-                        bag_id=f"BAG_{self.context.bag_count + 1:04d}",
-                        confidence=best_detection['confidence'],
-                        bbox=best_detection['bbox'],
-                        timestamp=frame_data['timestamp'],
-                        frame_id=frame_id,
-                        class_id=best_detection['class_id'],
-                        class_name=best_detection['class_name']
-                    )
-
-                    await self._handle_bag_detected(bag_detection)
-                else:
-                    await self._handle_no_detection()
-            else:
-                await self._handle_no_detection()
-
-        except Exception as e:
-            logger.error(f"Frame processing error: {e}")
-            self.context.error_message = str(e)
-            self.change_state(AgentState.ERROR)
-
-    async def _handle_bag_detected(self, detection: BagDetection):
-        """Handle bag detection event"""
-        if self.state == AgentState.WAITING_FIRST_BAG:
-            self.context.first_bag = detection
-            self.context.bag_count = 1
-            self.context.last_detection_time = datetime.now()
-            self.change_state(AgentState.FIRST_BAG_DETECTED)
-
-            # Trigger OCR processing
-            await self._process_ocr(detection, is_first=True)
-
-        elif self.state == AgentState.TRACKING_BAGS:
-            self.context.bag_count += 1
-            self.context.frames_without_detection = 0
-            self.context.last_detection_time = datetime.now()
-            self.last_bag_candidate = detection
-
-            # Process OCR for this bag if configured
-            if self.process_all_bags:
-                await self._process_ocr(detection, is_first=False)
-
-    async def _handle_no_detection(self):
-        """Handle frames without bag detection"""
-        self.context.frames_without_detection += 1
-
-        if self.state == AgentState.TRACKING_BAGS:
-            # Check timeout for last bag
-            if self.context.last_detection_time:
-                elapsed = (datetime.now() - self.context.last_detection_time).total_seconds()
-                if elapsed >= self.last_bag_timeout:
-                    logger.info(f"Last bag timeout reached ({elapsed:.2f}s)")
-                    await self._handle_last_bag_timeout()
-
-    async def _handle_last_bag_timeout(self):
-        """Handle last bag timeout"""
-        if self.last_bag_candidate:
-            self.context.last_bag = self.last_bag_candidate
-            self.change_state(AgentState.LAST_BAG_DETECTED)
-
-            # Process last bag OCR
-            await self._process_ocr(self.context.last_bag, is_first=False, is_last=True)
-        else:
-            # No last bag, just complete
-            await self._complete_session()
-
-    async def _process_ocr(self, detection: BagDetection, is_first: bool = False, is_last: bool = False):
-        """Process OCR for detected bag"""
-        try:
-            logger.info(f"Processing OCR for bag {detection.bag_id}")
-
-            if self.current_frame is None:
-                logger.warning("No current frame available for OCR")
-                return
-
-            # Extract barcode using OCR engine
-            barcode = self.ocr_engine.extract_barcode(self.current_frame, detection.bbox)
-
-            if barcode:
-                ocr_result = OCRResult(
-                    barcode=barcode,
-                    confidence=random.uniform(0.85, 0.98) if self.ocr_engine.custom_model_loaded else random.uniform(0.7, 0.9),
-                    text_data={"type": "barcode", "position": detection.bbox, "model": self.ocr_engine.model_name},
-                    timestamp=datetime.now(),
-                    bag_id=detection.bag_id,
-                    bbox=detection.bbox
-                )
-
-                self.context.ocr_results.append(ocr_result)
-                logger.info(f"Barcode extracted: {barcode}")
-
-                # If first bag processed, start tracking
-                if is_first and self.state == AgentState.FIRST_BAG_DETECTED:
-                    self.change_state(AgentState.TRACKING_BAGS)
-
-                # If last bag processed, complete session
-                if is_last and self.state == AgentState.LAST_BAG_DETECTED:
-                    await self._complete_session()
-
-        except Exception as e:
-            logger.error(f"OCR processing error: {e}")
-
-    async def _complete_session(self):
-        """Complete the session"""
-        self.change_state(AgentState.COMPLETED)
-        logger.info(f"Session completed: {self.context.bag_count} bags processed, "
-                   f"{len(self.context.ocr_results)} barcodes extracted")
-
+        self.state_history.append((old_state.name, new_state.name, datetime.now()))
+        logger.info(f"State change: {old_state.name} -> {new_state.name}")
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get current pipeline status"""
+        return {
+            'state': self.state.name,
+            'session_id': self.context.session_id,
+            'total_bags': self.context.total_bags,
+            'first_bag': self.context.first_bag.bag_id if self.context.first_bag else None,
+            'last_bag': self.context.last_bag.bag_id if self.context.last_bag else None,
+            'first_barcode': self.context.first_barcode,
+            'last_barcode': self.context.last_barcode,
+            'frames_processed': self.frame_count,
+            'frames_without_bag': self.context.frames_without_bag,
+            'ocr_results': len(self.context.ocr_results),
+            'avg_processing_time': np.mean(self.processing_times) if self.processing_times else 0
+        }
+    
     def reset(self):
-        """Reset agent to initial state"""
+        """Reset the agent to initial state"""
         self.state = AgentState.IDLE
-        self.context = AgentContext()
-        self.last_bag_candidate = None
+        self.context = PipelineContext()
         self.current_frame = None
         self.frame_count = 0
-        self.state_history.clear()
+        self.processing_times = []
+        self.state_history = []
+        self.last_detection_time = None
         logger.info("Agent reset")
 
-    def get_status(self) -> Dict:
-        """Get current agent status"""
-        return {
-            "state": self.state.name,
-            "session_id": self.context.session_id,
-            "bag_count": self.context.bag_count,
-            "ocr_count": len(self.context.ocr_results),
-            "frames_without_detection": self.context.frames_without_detection,
-            "error": self.context.error_message,
-            "frame_count": self.frame_count,
-            "ocr_model": self.ocr_engine.model_name
-        }
-
-    def load_ocr_model(self, uploaded_file):
-        """Load custom OCR model"""
-        return self.ocr_engine.load_custom_model(uploaded_file)
-
-def create_conveyor_frame(frame_count: int, width: int = 640, height: int = 480) -> Image.Image:
-    """Create a conveyor belt simulation frame"""
-    # Create base image
-    img = Image.new('RGB', (width, height), color=(50, 50, 50))
-    draw = ImageDraw.Draw(img)
+# Visualization functions
+def draw_pipeline_frame(frame: np.ndarray, agent: BagDetectionAgent) -> np.ndarray:
+    """Draw pipeline information on frame"""
+    display_frame = frame.copy()
+    status = agent.get_status()
     
-    # Draw conveyor belt
-    belt_color = (100, 100, 100)
-    belt_top = height // 2 - 60
-    belt_bottom = height // 2 + 60
-    draw.rectangle([50, belt_top, width-50, belt_bottom], fill=belt_color, outline=(150, 150, 150), width=2)
-    
-    # Draw moving elements
-    x_pos = (frame_count * 5) % (width - 100)
-    
-    # Draw bags based on simulation state
-    if st.session_state.get('processing', False):
-        # Simulate bags moving on conveyor
-        bag_positions = [(x_pos, belt_top + 20)]
-        
-        # Add some random bags
-        if random.random() > 0.7:
-            bag_positions.append(((x_pos + 200) % (width - 100), belt_top + 20))
-        
-        for bag_x, bag_y in bag_positions:
-            # Draw bag
-            bag_color = (0, 128, 255)  # Blue bags
-            draw.rectangle([bag_x, bag_y, bag_x + 80, bag_y + 120], 
-                         fill=bag_color, outline=(255, 255, 255), width=2)
+    # Draw detection boxes
+    if agent.context.all_detections:
+        for detection in agent.context.all_detections[-5:]:  # Last 5 detections
+            x1, y1, x2, y2 = detection.bbox
             
-            # Draw barcode area
-            draw.rectangle([bag_x + 10, bag_y + 90, bag_x + 70, bag_y + 110], 
-                         fill=(255, 255, 255), outline=(0, 0, 0), width=1)
+            # Color code: green for first, red for last, blue for others
+            if detection.bag_id == status['first_bag']:
+                color = (0, 255, 0)  # Green
+            elif detection.bag_id == status['last_bag']:
+                color = (0, 0, 255)  # Red
+            else:
+                color = (255, 255, 0)  # Blue
+            
+            cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+            
+            # Draw label
+            label = f"{detection.bag_id}: {detection.confidence:.2f}"
+            cv2.putText(display_frame, label, (x1, y1-10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     
-    # Draw conveyor rollers
-    for i in range(0, width, 30):
-        roller_y = belt_bottom + 10
-        draw.ellipse([i, roller_y, i + 20, roller_y + 20], fill=(150, 150, 150))
+    # Draw status overlay
+    overlay = display_frame.copy()
+    cv2.rectangle(overlay, (10, 10), (400, 250), (0, 0, 0), -1)
+    alpha = 0.7
+    cv2.addWeighted(overlay, alpha, display_frame, 1 - alpha, 0, display_frame)
     
-    # Add labels
-    try:
-        font = ImageFont.load_default()
-        draw.text((width//2 - 60, belt_top - 30), "Conveyor Belt", fill=(255, 255, 255), font=font)
-        draw.text((20, 20), f"Frame: {frame_count}", fill=(255, 255, 255), font=font)
-    except:
-        # Fallback if font loading fails
-        draw.text((width//2 - 60, belt_top - 30), "Conveyor Belt", fill=(255, 255, 255))
-        draw.text((20, 20), f"Frame: {frame_count}", fill=(255, 255, 255))
-    
-    return img
-
-def draw_detections_on_image(img: Image.Image, detections: List[Dict]) -> Image.Image:
-    """Draw detection bounding boxes on image"""
-    draw = ImageDraw.Draw(img)
-    
-    for detection in detections:
-        x1, y1, x2, y2 = detection['bbox']
-        confidence = detection['confidence']
-        
-        # Draw bounding box
-        draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=3)
-        
-        # Draw label background
-        label = f"Bag: {confidence:.2f}"
-        try:
-            font = ImageFont.load_default()
-            bbox = draw.textbbox((0, 0), label, font=font)
-        except:
-            bbox = (0, 0, len(label) * 6, 12)
-        
-        label_width = bbox[2] - bbox[0]
-        label_height = bbox[3] - bbox[1]
-        
-        draw.rectangle([x1, y1 - label_height - 5, x1 + label_width + 10, y1], 
-                      fill=(0, 255, 0))
-        
-        # Draw label text
-        draw.text((x1 + 5, y1 - label_height - 2), label, fill=(0, 0, 0))
-    
-    return img
-
-def draw_status_overlay_on_image(img: Image.Image, agent_status: Dict, context: AgentContext) -> Image.Image:
-    """Draw status information on image"""
-    draw = ImageDraw.Draw(img)
-    width, height = img.size
-    
-    # Draw semi-transparent overlay
-    overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
-    overlay_draw = ImageDraw.Draw(overlay)
-    overlay_draw.rectangle([10, 10, 400, 220], fill=(0, 0, 0, 180))
-    img = Image.alpha_composite(img.convert('RGBA'), overlay).convert('RGB')
-    draw = ImageDraw.Draw(img)
-    
-    # State colors
+    # Status text
     state_colors = {
-        "IDLE": (255, 255, 0),
-        "WAITING_FIRST_BAG": (255, 165, 0),
-        "FIRST_BAG_DETECTED": (0, 255, 255),
-        "TRACKING_BAGS": (0, 255, 0),
-        "LAST_BAG_DETECTED": (0, 200, 255),
-        "COMPLETED": (0, 255, 0),
-        "ERROR": (255, 0, 0)
+        'WAITING_FIRST_BAG': (0, 255, 255),
+        'FIRST_BAG_DETECTED': (0, 255, 0),
+        'TRACKING_BAGS': (255, 255, 0),
+        'WAITING_LAST_BAG': (255, 165, 0),
+        'COMPLETED': (0, 255, 0),
+        'ERROR': (0, 0, 255)
     }
     
-    color = state_colors.get(agent_status['state'], (255, 255, 255))
+    color = state_colors.get(status['state'], (255, 255, 255))
     
-    # Draw text information
-    status_lines = [
-        f"State: {agent_status['state']}",
-        f"Bags Detected: {context.bag_count}",
-        f"Barcodes Found: {len(context.ocr_results)}",
-        f"OCR Model: {agent_status.get('ocr_model', 'Default')}",
-        f"Session: {context.session_id}",
-        f"Frames w/o Detection: {context.frames_without_detection}",
-        f"Frame Count: {agent_status['frame_count']}"
+    lines = [
+        f"State: {status['state']}",
+        f"Bags: {status['total_bags']}",
+        f"First: {status['first_bag'] or 'None'}",
+        f"Last: {status['last_bag'] or 'None'}",
+        f"First Barcode: {status['first_barcode'] or 'None'}",
+        f"Last Barcode: {status['last_barcode'] or 'None'}",
+        f"Frames: {status['frames_processed']}",
+        f"OCR Results: {status['ocr_results']}",
+        f"Avg Time: {status['avg_processing_time']*1000:.1f}ms"
     ]
     
-    y_pos = 30
-    for line in status_lines:
-        draw.text((20, y_pos), line, fill=color)
-        y_pos += 25
+    for i, line in enumerate(lines):
+        y_pos = 40 + i * 25
+        cv2.putText(display_frame, line, (20, y_pos), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
     
-    # Draw recent barcodes
-    if context.ocr_results:
-        draw.text((20, 180), "Recent Barcodes:", fill=(255, 255, 0))
-        y_pos = 200
-        for i, ocr_result in enumerate(context.ocr_results[-2:]):
-            barcode_text = f"{ocr_result.barcode} ({ocr_result.confidence:.2f})"
-            draw.text((30, y_pos), barcode_text, fill=(255, 255, 0))
-            y_pos += 20
-    
-    return img
+    return display_frame
 
 # Streamlit App
 def main():
-    st.title("🛍️ Bag Detection AI Agent")
-    st.markdown("Production-ready state machine with OCR model upload capability")
-
-    # Initialize session state
+    st.title("🛍️ Bag Detection Pipeline Agent")
+    st.markdown("**Stapipy + YOLO + OCR Pipeline** - Manages 1st bag detection, barcode extraction, and last bag detection")
+    
+    # Initialize agent
     if 'agent' not in st.session_state:
-        st.session_state.agent = StateMachineAgent()
+        config = {
+            'confidence_threshold': 0.5,
+            'last_bag_timeout': 3.0,
+            'stable_frames': 5,
+            'source_type': 'synthetic'
+        }
+        st.session_state.agent = BagDetectionAgent(config)
+    
     if 'processing' not in st.session_state:
         st.session_state.processing = False
-    if 'frame_count' not in st.session_state:
-        st.session_state.frame_count = 0
-
+    
     # Sidebar Configuration
-    st.sidebar.header("Configuration")
+    st.sidebar.header("Pipeline Configuration")
     
-    # OCR Model Upload Section
-    st.sidebar.subheader("📁 Upload Custom OCR Model")
-    
-    uploaded_model = st.sidebar.file_uploader(
-        "Upload your trained OCR model",
-        type=['zip', 'pth', 'pt', 'onnx', 'h5', 'pkl'],
-        help="Upload your custom trained OCR model file"
-    )
-    
-    if uploaded_model is not None:
-        if st.sidebar.button("🚀 Load Custom Model"):
-            with st.spinner("Loading custom model..."):
-                success = st.session_state.agent.load_ocr_model(uploaded_model)
-                if success:
-                    st.sidebar.success(f"✅ Model '{uploaded_model.name}' loaded successfully!")
-                    st.sidebar.info("Custom model will provide better barcode detection accuracy")
-                else:
-                    st.sidebar.error("❌ Failed to load model")
-    
-    # Show current model status
-    current_status = st.session_state.agent.get_status()
-    if st.session_state.agent.ocr_engine.custom_model_loaded:
-        st.sidebar.success(f"📦 Using: {st.session_state.agent.ocr_engine.model_name}")
-    else:
-        st.sidebar.info("🔧 Using default OCR simulator")
-    
-    # Detection Parameters
-    st.sidebar.subheader("🎯 Detection Parameters")
+    st.sidebar.subheader("Detection Parameters")
     confidence_threshold = st.sidebar.slider("Confidence Threshold", 0.1, 1.0, 0.5)
-    last_bag_timeout = st.sidebar.slider("Last Bag Timeout (sec)", 1, 30, 5)
-    process_all_bags = st.sidebar.checkbox("Process All Bags", value=True)
-
+    last_bag_timeout = st.sidebar.slider("Last Bag Timeout (sec)", 1, 10, 3)
+    
+    st.sidebar.subheader("OCR Configuration")
+    ocr_engine = st.sidebar.selectbox("OCR Engine", ["paddle", "simulated"])
+    
     # Update agent config
     st.session_state.agent.config.update({
-        'min_confidence': confidence_threshold,
+        'confidence_threshold': confidence_threshold,
         'last_bag_timeout': last_bag_timeout,
-        'process_all_bags': process_all_bags
+        'ocr_engine': ocr_engine
     })
-
-    # Main content area
+    
+    # Main interface
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.subheader("Live Processing")
+        st.subheader("Pipeline Live View")
         
-        # Processing controls
-        control_col1, control_col2, control_col3 = st.columns(3)
-        
-        with control_col1:
-            if st.button("🎬 Start Processing", use_container_width=True):
+        # Controls
+        col1a, col1b, col1c = st.columns(3)
+        with col1a:
+            if st.button("🚀 Start Pipeline", use_container_width=True) and not st.session_state.processing:
                 st.session_state.processing = True
-                st.session_state.agent.reset()
-                st.session_state.frame_count = 0
-                
-        with control_col2:
-            if st.button("⏹️ Stop Processing", use_container_width=True):
+                st.session_state.agent.start_pipeline()
+        with col1b:
+            if st.button("⏹️ Stop Pipeline", use_container_width=True):
                 st.session_state.processing = False
-                
-        with control_col3:
-            if st.button("🔄 Reset Agent", use_container_width=True):
-                st.session_state.agent.reset()
+                st.session_state.agent.stop_pipeline()
+        with col1c:
+            if st.button("🔄 Reset Pipeline", use_container_width=True):
                 st.session_state.processing = False
-                st.session_state.frame_count = 0
+                st.session_state.agent.reset()
+                st.rerun()
         
-        # Video feed placeholder
+        # Live feed
         video_placeholder = st.empty()
         status_placeholder = st.empty()
         
-        # Process frames if active
+        # Processing loop
         if st.session_state.processing:
-            # Create conveyor frame
-            st.session_state.frame_count += 1
-            conveyor_img = create_conveyor_frame(st.session_state.frame_count)
+            continue_processing = st.session_state.agent.process_single_frame()
             
-            # Convert to numpy array for processing
-            frame_np = np.array(conveyor_img)
-            
-            # Create frame data
-            frame_data = {
-                'frame': frame_np,
-                'frame_id': st.session_state.frame_count,
-                'timestamp': datetime.now()
-            }
-            
-            # Simulate async processing
-            import asyncio
-            try:
-                # Start agent if not already started
-                if st.session_state.agent.state == AgentState.IDLE:
-                    asyncio.run(st.session_state.agent.start())
+            if st.session_state.agent.current_frame is not None:
+                # Draw visualization
+                display_frame = draw_pipeline_frame(
+                    st.session_state.agent.current_frame, 
+                    st.session_state.agent
+                )
                 
-                # Process frame
-                asyncio.run(st.session_state.agent.process_frame(frame_data))
-                
-            except Exception as e:
-                st.error(f"Processing error: {e}")
+                # Convert to RGB for display
+                display_frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                video_placeholder.image(display_frame_rgb, caption="Live Pipeline View", use_column_width=True)
             
-            # Get detections for visualization
-            detections = st.session_state.agent.simulate_detection(frame_np)
+            # Update status
+            status = st.session_state.agent.get_status()
+            display_pipeline_status(status, status_placeholder)
             
-            # Draw visualizations
-            display_img = draw_detections_on_image(conveyor_img, detections)
-            agent_status = st.session_state.agent.get_status()
-            display_img = draw_status_overlay_on_image(display_img, agent_status, st.session_state.agent.context)
-            
-            # Display image
-            video_placeholder.image(display_img, caption="Live Conveyor Feed with Detections", use_column_width=True)
-            
-            # Display status
-            display_agent_status(agent_status, st.session_state.agent.context, status_placeholder)
-            
-            # Auto-reset if completed
-            if agent_status['state'] == 'COMPLETED':
-                time.sleep(3)
-                st.session_state.agent.reset()
-                st.rerun()
-                
+            # Check if completed
+            if not continue_processing:
+                st.session_state.processing = False
+                if status['state'] == 'COMPLETED':
+                    st.balloons()
+                    st.success("🎉 Pipeline completed successfully!")
+                elif status['state'] == 'ERROR':
+                    st.error("❌ Pipeline encountered an error")
+        
         else:
-            # Show static conveyor when not processing
-            conveyor_img = create_conveyor_frame(0)
-            video_placeholder.image(conveyor_img, caption="Ready to Start Processing", use_column_width=True)
-            status_placeholder.info("Click 'Start Processing' to begin bag detection")
+            # Show static state when not processing
+            if st.session_state.agent.current_frame is not None:
+                display_frame = draw_pipeline_frame(
+                    st.session_state.agent.current_frame, 
+                    st.session_state.agent
+                )
+                display_frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                video_placeholder.image(display_frame_rgb, caption="Pipeline Ready", use_column_width=True)
+            else:
+                # Generate initial frame
+                frame_data = st.session_state.agent.stapipy.get_frame()
+                if frame_data:
+                    st.session_state.agent.current_frame = frame_data['frame']
+                    display_frame = draw_pipeline_frame(
+                        st.session_state.agent.current_frame, 
+                        st.session_state.agent
+                    )
+                    display_frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                    video_placeholder.image(display_frame_rgb, caption="Pipeline Ready", use_column_width=True)
+            
+            status_placeholder.info("Click 'Start Pipeline' to begin processing")
     
     with col2:
-        st.subheader("Agent Statistics")
-        display_statistics(st.session_state.agent)
-
+        st.subheader("Pipeline Statistics")
+        display_pipeline_statistics(st.session_state.agent)
+    
     # Results section
     st.markdown("---")
-    st.subheader("📊 Processing Results")
-    display_results(st.session_state.agent.context)
+    st.subheader("Pipeline Results")
+    display_pipeline_results(st.session_state.agent.context)
 
-def display_agent_status(agent_status: Dict, context: AgentContext, placeholder):
-    """Display current agent status"""
+def display_pipeline_status(status: Dict, placeholder):
+    """Display current pipeline status"""
     with placeholder.container():
-        st.subheader("Current Status")
+        st.subheader("Pipeline Status")
         
-        state_colors = {
-            "IDLE": "blue", "WAITING_FIRST_BAG": "yellow",
-            "FIRST_BAG_DETECTED": "orange", "TRACKING_BAGS": "green",
-            "LAST_BAG_DETECTED": "purple", "COMPLETED": "green", "ERROR": "red"
+        state_icons = {
+            'WAITING_FIRST_BAG': '⏳',
+            'FIRST_BAG_DETECTED': '✅',
+            'TRACKING_BAGS': '📦',
+            'WAITING_LAST_BAG': '⏳',
+            'COMPLETED': '🎉',
+            'ERROR': '❌'
         }
         
-        state_color = state_colors.get(agent_status['state'], "gray")
-        st.markdown(f"**State:** <span style='color: {state_color}; font-weight: bold; font-size: 1.2em'>{agent_status['state']}</span>", 
-                   unsafe_allow_html=True)
+        icon = state_icons.get(status['state'], '🔧')
+        st.markdown(f"### {icon} {status['state']}")
         
-        col1, col2, col3 = st.columns(3)
+        # Metrics
+        col1, col2 = st.columns(2)
         with col1:
-            st.metric("Bags Detected", agent_status['bag_count'])
+            st.metric("Total Bags", status['total_bags'])
+            st.metric("Frames Processed", status['frames_processed'])
         with col2:
-            st.metric("Barcodes Found", agent_status['ocr_count'])
-        with col3:
-            st.metric("Frames Processed", agent_status['frame_count'])
+            st.metric("OCR Results", status['ocr_results'])
+            st.metric("Avg Processing Time", f"{status['avg_processing_time']*1000:.1f}ms")
         
-        # Model info
-        if agent_status.get('ocr_model', 'Default') != 'Default Simulator':
-            st.success(f"📦 OCR Model: {agent_status['ocr_model']}")
-        
-        if context.first_bag:
-            st.info(f"First Bag: {context.first_bag.bag_id} (Confidence: {context.first_bag.confidence:.2f})")
-        if context.last_bag:
-            st.info(f"Last Bag: {context.last_bag.bag_id} (Confidence: {context.last_bag.confidence:.2f})")
-        
-        if agent_status['state'] == 'COMPLETED':
-            st.success("🎉 Processing completed successfully!")
-        elif agent_status['state'] == 'ERROR':
-            st.error(f"❌ Error: {agent_status['error']}")
+        # First/Last bag info
+        if status['first_bag']:
+            st.info(f"**First Bag:** {status['first_bag']} - Barcode: {status['first_barcode'] or 'Processing...'}")
+        if status['last_bag']:
+            st.info(f"**Last Bag:** {status['last_bag']} - Barcode: {status['last_barcode'] or 'Processing...'}")
 
-def display_statistics(agent):
-    """Display agent statistics and charts"""
-    if st.session_state.processing:
-        agent_status = agent.get_status()
+def display_pipeline_statistics(agent: BagDetectionAgent):
+    """Display pipeline statistics and charts"""
+    if agent.frame_count > 0:
+        status = agent.get_status()
         
-        # State history chart
+        # State history
         if agent.state_history:
-            df_states = pd.DataFrame(agent.state_history)
+            df_states = pd.DataFrame(agent.state_history, columns=['old_state', 'new_state', 'timestamp'])
             df_states['time'] = pd.to_datetime(df_states['timestamp'])
             
-            fig = px.timeline(df_states, x_start="time", y="new_state", color="new_state",
-                             title="State Transition History", height=300)
+            fig = px.timeline(df_states, x_start='time', y='new_state', color='new_state',
+                             title='State Transition Timeline', height=300)
             st.plotly_chart(fig, use_container_width=True)
         
-        # Session information
-        st.subheader("Session Info")
+        # Performance metrics
+        st.subheader("Performance")
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Session ID", agent.context.session_id[:8] + "...")
+            st.metric("Session ID", status['session_id'][-8:])
         with col2:
             st.metric("State Changes", len(agent.state_history))
         with col3:
-            st.metric("No Detection Frames", agent.context.frames_without_detection)
+            st.metric("No Bag Frames", status['frames_without_bag'])
         
-        # State distribution pie chart
-        if agent.state_history:
-            state_counts = pd.DataFrame(agent.state_history)['new_state'].value_counts()
-            fig = px.pie(values=state_counts.values, names=state_counts.index,
-                        title="State Distribution", height=250)
+        # Processing time distribution
+        if agent.processing_times:
+            fig = px.histogram(x=agent.processing_times, 
+                             title='Processing Time Distribution',
+                             labels={'x': 'Time (seconds)', 'y': 'Frequency'})
             st.plotly_chart(fig, use_container_width=True)
     
     else:
-        st.info("Start processing to see statistics")
+        st.info("Start the pipeline to see statistics")
 
-def display_results(context: AgentContext):
-    """Display processing results"""
+def display_pipeline_results(context: PipelineContext):
+    """Display pipeline results"""
     if context.ocr_results:
-        st.success(f"✅ Successfully extracted {len(context.ocr_results)} barcodes")
+        st.success(f"Pipeline completed with {len(context.ocr_results)} barcode extractions")
         
-        # Create results table
+        # Results table
         results_data = []
-        for i, ocr_result in enumerate(context.ocr_results, 1):
+        for ocr in context.ocr_results:
             results_data.append({
-                "Bag #": i,
-                "Bag ID": ocr_result.bag_id,
-                "Barcode": ocr_result.barcode,
-                "Confidence": f"{ocr_result.confidence:.2f}",
-                "Timestamp": ocr_result.timestamp.strftime("%H:%M:%S")
+                'Bag ID': ocr.bag_id,
+                'Barcode': ocr.barcode,
+                'Confidence': f"{ocr.confidence:.2f}",
+                'First Bag': '✅' if ocr.is_first_bag else '',
+                'Last Bag': '✅' if ocr.is_last_bag else '',
+                'Timestamp': ocr.timestamp.strftime("%H:%M:%S")
             })
         
         df_results = pd.DataFrame(results_data)
         st.dataframe(df_results, use_container_width=True)
         
-        # Download results
-        json_data = json.dumps(context.to_dict(), indent=2, default=str)
+        # Export results
+        export_data = {
+            'session_id': context.session_id,
+            'pipeline_start': context.pipeline_start_time.isoformat() if context.pipeline_start_time else None,
+            'first_bag': {
+                'bag_id': context.first_bag.bag_id if context.first_bag else None,
+                'barcode': context.first_barcode,
+                'timestamp': context.first_bag.timestamp.isoformat() if context.first_bag else None
+            },
+            'last_bag': {
+                'bag_id': context.last_bag.bag_id if context.last_bag else None,
+                'barcode': context.last_barcode,
+                'timestamp': context.last_bag.timestamp.isoformat() if context.last_bag else None
+            },
+            'total_bags': context.total_bags,
+            'all_ocr_results': [
+                {
+                    'bag_id': ocr.bag_id,
+                    'barcode': ocr.barcode,
+                    'timestamp': ocr.timestamp.isoformat(),
+                    'is_first': ocr.is_first_bag,
+                    'is_last': ocr.is_last_bag
+                } for ocr in context.ocr_results
+            ]
+        }
+        
+        json_data = json.dumps(export_data, indent=2)
         st.download_button(
-            label="📥 Download Results JSON",
+            label="📥 Export Pipeline Results",
             data=json_data,
-            file_name=f"session_{context.session_id}.json",
+            file_name=f"pipeline_results_{context.session_id}.json",
             mime="application/json"
         )
+    
+    elif st.session_state.processing:
+        st.info("Pipeline running... results will appear here when complete")
     else:
-        st.warning("No barcodes extracted yet. Start processing to see results.")
+        st.warning("No pipeline results yet. Start the pipeline to begin processing.")
 
 if __name__ == "__main__":
     main()
