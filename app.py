@@ -1,5 +1,4 @@
 import streamlit as st
-import cv2
 import numpy as np
 import time
 import logging
@@ -9,14 +8,11 @@ from typing import Optional, Dict, List, Any, Tuple
 from datetime import datetime
 import pandas as pd
 import plotly.express as px
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import json
-import tempfile
-import os
-from pathlib import Path
-import asyncio
-import queue
-import threading
+import random
+import io
+import base64
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,7 +41,7 @@ class AgentState(Enum):
 
 @dataclass
 class BagDetection:
-    """Bag detection result from YOLO"""
+    """Bag detection result"""
     bag_id: str
     confidence: float
     bbox: Tuple[int, int, int, int]  # (x1, y1, x2, y2)
@@ -81,290 +77,152 @@ class PipelineContext:
     pipeline_start_time: Optional[datetime] = None
 
 class StapipySimulator:
-    """Simulates Stapipy frame grabbing"""
+    """Simulates Stapipy frame grabbing using PIL only"""
     
-    def __init__(self, source_type: str = "webcam", video_path: Optional[str] = None):
-        self.source_type = source_type
-        self.video_path = video_path
+    def __init__(self, width: int = 640, height: int = 480):
+        self.width = width
+        self.height = height
         self.frame_count = 0
-        self.cap = None
-        self._initialize_source()
+        self.bag_positions = []
     
-    def _initialize_source(self):
-        """Initialize video source"""
-        try:
-            if self.source_type == "webcam":
-                self.cap = cv2.VideoCapture(0)
-            elif self.source_type == "video_file" and self.video_path:
-                self.cap = cv2.VideoCapture(self.video_path)
-            else:
-                # Create synthetic frames
-                self.cap = None
-        except Exception as e:
-            logger.warning(f"Could not initialize video source: {e}")
-            self.cap = None
-    
-    def get_frame(self) -> Optional[Dict]:
-        """Get next frame from source"""
-        try:
-            if self.cap and self.cap.isOpened():
-                ret, frame = self.cap.read()
-                if ret:
-                    self.frame_count += 1
-                    return {
-                        'frame': frame,
-                        'frame_id': self.frame_count,
-                        'timestamp': datetime.now(),
-                        'source': 'stapipy'
-                    }
-                else:
-                    # Loop video or restart webcam
-                    if self.source_type == "video_file":
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        return self.get_frame()
-                    return None
-            else:
-                # Generate synthetic frame
-                return self._generate_synthetic_frame()
-                
-        except Exception as e:
-            logger.error(f"Frame capture error: {e}")
-            return None
-    
-    def _generate_synthetic_frame(self) -> Dict:
-        """Generate synthetic conveyor belt frame"""
+    def get_frame(self) -> Dict:
+        """Generate a conveyor belt frame"""
         self.frame_count += 1
         
-        # Create a realistic conveyor belt frame
-        frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        frame[:,:] = (50, 50, 50)  # Dark gray background
+        # Create base image
+        img = Image.new('RGB', (self.width, self.height), color=(50, 50, 50))
+        draw = ImageDraw.Draw(img)
         
         # Draw conveyor belt
-        belt_y1, belt_y2 = 150, 330
-        cv2.rectangle(frame, (50, belt_y1), (590, belt_y2), (100, 100, 100), -1)
-        cv2.rectangle(frame, (50, belt_y1), (590, belt_y2), (150, 150, 150), 2)
+        belt_top = self.height // 2 - 60
+        belt_bottom = self.height // 2 + 60
         
-        # Draw moving elements based on frame count
-        x_pos = (self.frame_count * 3) % 600
+        # Conveyor belt
+        draw.rectangle([50, belt_top, self.width-50, belt_bottom], 
+                      fill=(100, 100, 100), outline=(150, 150, 150), width=2)
         
-        # Occasionally add bags
-        if random.random() > 0.4:  # 60% chance of bag
+        # Update bag positions (moving right to left)
+        self._update_bag_positions()
+        
+        # Draw bags
+        self.bag_positions = []
+        num_bags = random.choices([0, 1, 2], weights=[0.3, 0.5, 0.2])[0]
+        
+        for i in range(num_bags):
+            bag_x = 50 + ((self.frame_count * 4 + i * 200) % (self.width - 200))
+            bag_y = belt_top + 10
             bag_width, bag_height = 80, 120
-            bag_x = 50 + x_pos
-            bag_y = belt_y1 + 10
             
             # Draw bag
-            cv2.rectangle(frame, (bag_x, bag_y), (bag_x + bag_width, bag_y + bag_height), 
-                         (0, 100, 200), -1)
-            cv2.rectangle(frame, (bag_x, bag_y), (bag_x + bag_width, bag_y + bag_height), 
-                         (255, 255, 255), 2)
+            draw.rectangle([bag_x, bag_y, bag_x + bag_width, bag_y + bag_height], 
+                          fill=(0, 100, 200), outline=(255, 255, 255), width=2)
             
-            # Draw barcode area
+            # Draw barcode area (white rectangle with black lines)
             barcode_y = bag_y + bag_height - 25
-            cv2.rectangle(frame, (bag_x + 10, barcode_y), (bag_x + bag_width - 10, bag_y + bag_height - 5), 
-                         (255, 255, 255), -1)
-            # Simulate barcode lines
-            for i in range(bag_x + 15, bag_x + bag_width - 15, 5):
+            draw.rectangle([bag_x + 10, barcode_y, bag_x + bag_width - 10, bag_y + bag_height - 5], 
+                          fill=(255, 255, 255))
+            
+            # Draw barcode lines
+            for line_x in range(bag_x + 15, bag_x + bag_width - 15, 4):
                 if random.random() > 0.3:
-                    cv2.line(frame, (i, barcode_y), (i, bag_y + bag_height - 10), (0, 0, 0), 1)
+                    line_height = random.randint(8, 15)
+                    draw.rectangle([line_x, barcode_y, line_x + 2, barcode_y + line_height], 
+                                  fill=(0, 0, 0))
+            
+            self.bag_positions.append({
+                'bbox': (bag_x, bag_y, bag_x + bag_width, bag_y + bag_height),
+                'confidence': random.uniform(0.7, 0.95)
+            })
         
-        # Add text
-        cv2.putText(frame, "Conveyor Belt - Stapipy Stream", (150, 50), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(frame, f"Frame: {self.frame_count}", (20, 430), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Draw conveyor text
+        try:
+            font = ImageFont.load_default()
+            draw.text((self.width//2 - 70, belt_top - 30), "Conveyor Belt - Stapipy Stream", 
+                     fill=(255, 255, 255), font=font)
+            draw.text((20, 20), f"Frame: {self.frame_count}", 
+                     fill=(255, 255, 255), font=font)
+        except:
+            draw.text((self.width//2 - 70, belt_top - 30), "Conveyor Belt - Stapipy Stream", 
+                     fill=(255, 255, 255))
+            draw.text((20, 20), f"Frame: {self.frame_count}", 
+                     fill=(255, 255, 255))
+        
+        # Convert to numpy for processing
+        frame_np = np.array(img)
         
         return {
-            'frame': frame,
+            'frame': frame_np,
             'frame_id': self.frame_count,
             'timestamp': datetime.now(),
-            'source': 'synthetic'
+            'source': 'stapipy_simulator',
+            'bag_positions': self.bag_positions
         }
     
-    def release(self):
-        """Release resources"""
-        if self.cap:
-            self.cap.release()
+    def _update_bag_positions(self):
+        """Update bag positions for movement"""
+        # This is handled in get_frame during drawing
+        pass
 
-class YOLODetector:
-    """YOLO detection wrapper"""
+class YOLOSimulator:
+    """Simulates YOLO detection using the bag positions from Stapipy"""
     
-    def __init__(self, model_path: str = "yolov8n.pt", conf_threshold: float = 0.5):
-        self.model_path = model_path
+    def __init__(self, conf_threshold: float = 0.5):
         self.conf_threshold = conf_threshold
-        self.model = None
-        self._load_model()
     
-    def _load_model(self):
-        """Load YOLO model"""
-        try:
-            from ultralytics import YOLO
-            self.model = YOLO(self.model_path)
-            st.success(f"✅ YOLO model loaded: {self.model_path}")
-        except Exception as e:
-            st.warning(f"⚠️ YOLO not available, using simulation: {e}")
-            self.model = None
-    
-    def detect(self, frame: np.ndarray) -> List[Dict]:
-        """Detect objects in frame"""
-        if self.model is None:
-            return self._simulate_detection(frame)
-        
-        try:
-            results = self.model(frame, conf=self.conf_threshold, verbose=False)
-            detections = []
-            
-            for result in results:
-                if result.boxes is not None:
-                    for box in result.boxes:
-                        x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-                        conf = float(box.conf[0].cpu().numpy())
-                        cls = int(box.cls[0].cpu().numpy())
-                        
-                        class_name = result.names[cls] if hasattr(result, 'names') else "object"
-                        
-                        # Filter for bags/objects of interest
-                        if class_name in ["bag", "suitcase", "backpack", "handbag"] or conf > 0.5:
-                            detections.append({
-                                'bbox': (x1, y1, x2, y2),
-                                'confidence': conf,
-                                'class_id': cls,
-                                'class_name': class_name
-                            })
-            
-            return detections
-            
-        except Exception as e:
-            logger.error(f"YOLO detection error: {e}")
-            return self._simulate_detection(frame)
-    
-    def _simulate_detection(self, frame: np.ndarray) -> List[Dict]:
-        """Simulate bag detection"""
-        height, width = frame.shape[:2]
+    def detect(self, frame_data: Dict) -> List[Dict]:
+        """Detect bags in frame - uses pre-computed positions from Stapipy"""
         detections = []
         
-        # Look for bag-like rectangles in the conveyor area
-        conveyor_region = frame[150:330, 50:590]  # Conveyor belt area
-        
-        # Simple color-based detection for blue bags
-        blue_lower = np.array([100, 0, 0])
-        blue_upper = np.array([255, 100, 100])
-        blue_mask = cv2.inRange(conveyor_region, blue_lower, blue_upper)
-        
-        contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area > 1000:  # Minimum bag size
-                x, y, w, h = cv2.boundingRect(contour)
-                # Convert to full frame coordinates
-                x_full = x + 50
-                y_full = y + 150
-                
+        # Use the bag positions from Stapipy simulator
+        for bag in frame_data.get('bag_positions', []):
+            if bag['confidence'] >= self.conf_threshold:
                 detections.append({
-                    'bbox': (x_full, y_full, x_full + w, y_full + h),
-                    'confidence': min(0.9, area / 5000),  # Scale confidence by size
+                    'bbox': bag['bbox'],
+                    'confidence': bag['confidence'],
                     'class_id': 0,
                     'class_name': 'bag'
                 })
         
-        # If no contours found, use random detection for demo
-        if not detections and random.random() > 0.6:
-            w, h = 80, 120
-            x = random.randint(50, width - w - 50)
-            y = random.randint(150, 330 - h)
-            
-            detections.append({
-                'bbox': (x, y, x + w, y + h),
-                'confidence': random.uniform(0.7, 0.95),
+        # Occasionally add false positives or miss detections for realism
+        if random.random() < 0.1:  # 10% chance of false positive
+            false_positive = {
+                'bbox': (
+                    random.randint(50, 500),
+                    random.randint(150, 250),
+                    random.randint(100, 600),
+                    random.randint(200, 350)
+                ),
+                'confidence': random.uniform(0.3, 0.6),  # Low confidence
                 'class_id': 0,
                 'class_name': 'bag'
-            })
+            }
+            detections.append(false_positive)
+        
+        # Occasionally miss a detection
+        if detections and random.random() < 0.1:  # 10% chance to miss
+            detections.pop()
         
         return detections
 
-class OCREngine:
-    """OCR engine for barcode extraction"""
+class OCRSimulator:
+    """Simulates OCR barcode extraction"""
     
-    def __init__(self, engine_type: str = "paddle", model_path: Optional[str] = None):
-        self.engine_type = engine_type
-        self.model_path = model_path
-        self.engine = None
-        self._load_engine()
-    
-    def _load_engine(self):
-        """Load OCR engine"""
-        try:
-            if self.engine_type == "paddle":
-                from paddleocr import PaddleOCR
-                self.engine = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
-                st.success("✅ PaddleOCR engine loaded")
-            else:
-                st.warning("Using OCR simulation")
-                self.engine = None
-        except Exception as e:
-            st.warning(f"OCR engine not available: {e}")
-            self.engine = None
+    def __init__(self):
+        self.barcode_database = [
+            "5901234123457", "9780201379624", "1234567890128",
+            "4006381333931", "3661112507010", "5449000000996", 
+            "3017620422003", "7613032620033", "8000500310427",
+            "123456789012", "987654321098", "456123789045"
+        ]
+        self.success_rate = 0.8  # 80% success rate
     
     def extract_barcode(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[str]:
-        """Extract barcode from bag region"""
-        if self.engine is None:
-            return self._simulate_barcode_extraction()
+        """Simulate barcode extraction from bag region"""
+        # Simulate processing time
+        time.sleep(0.01)
         
-        try:
-            x1, y1, x2, y2 = bbox
-            roi = frame[y1:y2, x1:x2]
-            
-            if roi.size == 0:
-                return None
-            
-            # Convert to RGB for OCR
-            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-            
-            if self.engine_type == "paddle":
-                result = self.engine.ocr(roi_rgb, cls=True)
-                
-                if result and result[0]:
-                    texts = [line[1][0] for line in result[0]]
-                    barcode = self._find_barcode_pattern(texts)
-                    if barcode:
-                        return barcode
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"OCR extraction error: {e}")
-            return self._simulate_barcode_extraction()
-    
-    def _find_barcode_pattern(self, texts: List[str]) -> Optional[str]:
-        """Find barcode patterns in OCR results"""
-        import re
-        
-        barcode_patterns = [
-            r'\b\d{12,13}\b',      # EAN-13, UPC
-            r'\b\d{8}\b',          # EAN-8
-            r'\b[A-Z0-9]{8,15}\b', # Alphanumeric codes
-        ]
-        
-        for text in texts:
-            for pattern in barcode_patterns:
-                match = re.search(pattern, text.replace(' ', ''))
-                if match:
-                    return match.group(0)
-        
-        return None
-    
-    def _simulate_barcode_extraction(self) -> Optional[str]:
-        """Simulate barcode extraction"""
-        barcodes = [
-            "5901234123457", "9780201379624", "1234567890128",
-            "4006381333931", "3661112507010", "5449000000996",
-            "3017620422003", "7613032620033", "8000500310427"
-        ]
-        
-        # 70% success rate for simulation
-        if random.random() > 0.3:
-            return random.choice(barcodes)
+        if random.random() <= self.success_rate:
+            return random.choice(self.barcode_database)
         return None
 
 class BagDetectionAgent:
@@ -381,21 +239,14 @@ class BagDetectionAgent:
         self.state = AgentState.IDLE
         self.context = PipelineContext()
         
-        # Pipeline components
-        self.stapipy = StapipySimulator(
-            source_type=config.get('source_type', 'synthetic'),
-            video_path=config.get('video_path')
-        )
-        self.yolo = YOLODetector(
-            model_path=config.get('yolo_model', 'yolov8n.pt'),
-            conf_threshold=config.get('confidence_threshold', 0.5)
-        )
-        self.ocr = OCREngine(
-            engine_type=config.get('ocr_engine', 'paddle')
-        )
+        # Pipeline components (all simulated)
+        self.stapipy = StapipySimulator()
+        self.yolo = YOLOSimulator(conf_threshold=config.get('confidence_threshold', 0.5))
+        self.ocr = OCRSimulator()
         
         # State tracking
         self.current_frame = None
+        self.current_frame_data = None
         self.processing_active = False
         self.state_history = []
         self.last_detection_time = None
@@ -418,7 +269,6 @@ class BagDetectionAgent:
     def stop_pipeline(self):
         """Stop the processing pipeline"""
         self.processing_active = False
-        self.stapipy.release()
         logger.info("Pipeline stopped")
     
     def process_single_frame(self) -> bool:
@@ -435,14 +285,11 @@ class BagDetectionAgent:
         try:
             # 1. Stapipy Frame Grabbing
             frame_data = self.stapipy.get_frame()
-            if frame_data is None:
-                logger.warning("No frame received from Stapipy")
-                return True
-            
+            self.current_frame_data = frame_data
             self.current_frame = frame_data['frame']
             
             # 2. YOLO Detection
-            detections = self.yolo.detect(self.current_frame)
+            detections = self.yolo.detect(frame_data)
             
             # 3. State Management & OCR Processing
             has_bag = len(detections) > 0
@@ -537,7 +384,7 @@ class BagDetectionAgent:
             
             # Check for last bag timeout
             if self.last_detection_time:
-                timeout = self.config.get('last_bag_timeout', 5.0)
+                timeout = self.config.get('last_bag_timeout', 3.0)
                 elapsed = (datetime.now() - self.last_detection_time).total_seconds()
                 
                 if elapsed >= timeout:
@@ -554,7 +401,7 @@ class BagDetectionAgent:
             self.context.frames_without_bag += 1
             
             # Wait for stable no-bag period
-            stable_frames = self.config.get('stable_frames', 10)
+            stable_frames = self.config.get('stable_frames', 5)
             if self.context.frames_without_bag >= stable_frames:
                 # Set last bag and complete
                 if self.context.all_detections:
@@ -580,7 +427,7 @@ class BagDetectionAgent:
         if barcode:
             ocr_result = OCRResult(
                 barcode=barcode,
-                confidence=0.9,  # Would come from OCR engine
+                confidence=0.9,  # Simulated confidence
                 timestamp=datetime.now(),
                 bag_id=bag_detection.bag_id,
                 bbox=bag_detection.bbox,
@@ -626,16 +473,21 @@ class BagDetectionAgent:
         self.state = AgentState.IDLE
         self.context = PipelineContext()
         self.current_frame = None
+        self.current_frame_data = None
         self.frame_count = 0
         self.processing_times = []
         self.state_history = []
         self.last_detection_time = None
+        self.stapipy = StapipySimulator()  # Reset simulator
         logger.info("Agent reset")
 
-# Visualization functions
-def draw_pipeline_frame(frame: np.ndarray, agent: BagDetectionAgent) -> np.ndarray:
+# Visualization functions using PIL only
+def draw_pipeline_frame(frame_data: Dict, agent: BagDetectionAgent) -> Image.Image:
     """Draw pipeline information on frame"""
-    display_frame = frame.copy()
+    # Convert numpy array back to PIL Image
+    img = Image.fromarray(frame_data['frame'])
+    draw = ImageDraw.Draw(img)
+    
     status = agent.get_status()
     
     # Draw detection boxes
@@ -647,22 +499,32 @@ def draw_pipeline_frame(frame: np.ndarray, agent: BagDetectionAgent) -> np.ndarr
             if detection.bag_id == status['first_bag']:
                 color = (0, 255, 0)  # Green
             elif detection.bag_id == status['last_bag']:
-                color = (0, 0, 255)  # Red
+                color = (255, 0, 0)  # Red
             else:
-                color = (255, 255, 0)  # Blue
+                color = (255, 255, 0)  # Yellow
             
-            cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+            # Draw bounding box
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
             
             # Draw label
             label = f"{detection.bag_id}: {detection.confidence:.2f}"
-            cv2.putText(display_frame, label, (x1, y1-10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            try:
+                font = ImageFont.load_default()
+                bbox = draw.textbbox((0, 0), label, font=font)
+            except:
+                bbox = (0, 0, len(label) * 6, 12)
+            
+            label_width = bbox[2] - bbox[0]
+            draw.rectangle([x1, y1 - (bbox[3]-bbox[1]) - 5, x1 + label_width + 10, y1], 
+                          fill=color)
+            draw.text((x1 + 5, y1 - (bbox[3]-bbox[1]) - 2), label, fill=(0, 0, 0))
     
     # Draw status overlay
-    overlay = display_frame.copy()
-    cv2.rectangle(overlay, (10, 10), (400, 250), (0, 0, 0), -1)
-    alpha = 0.7
-    cv2.addWeighted(overlay, alpha, display_frame, 1 - alpha, 0, display_frame)
+    overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    overlay_draw.rectangle([10, 10, 400, 250], fill=(0, 0, 0, 180))
+    img = Image.alpha_composite(img.convert('RGBA'), overlay).convert('RGB')
+    draw = ImageDraw.Draw(img)
     
     # Status text
     state_colors = {
@@ -671,7 +533,7 @@ def draw_pipeline_frame(frame: np.ndarray, agent: BagDetectionAgent) -> np.ndarr
         'TRACKING_BAGS': (255, 255, 0),
         'WAITING_LAST_BAG': (255, 165, 0),
         'COMPLETED': (0, 255, 0),
-        'ERROR': (0, 0, 255)
+        'ERROR': (255, 0, 0)
     }
     
     color = state_colors.get(status['state'], (255, 255, 255))
@@ -685,15 +547,14 @@ def draw_pipeline_frame(frame: np.ndarray, agent: BagDetectionAgent) -> np.ndarr
         f"Last Barcode: {status['last_barcode'] or 'None'}",
         f"Frames: {status['frames_processed']}",
         f"OCR Results: {status['ocr_results']}",
-        f"Avg Time: {status['avg_processing_time']*1000:.1f}ms"
     ]
     
-    for i, line in enumerate(lines):
-        y_pos = 40 + i * 25
-        cv2.putText(display_frame, line, (20, y_pos), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+    y_pos = 30
+    for line in lines:
+        draw.text((20, y_pos), line, fill=color)
+        y_pos += 25
     
-    return display_frame
+    return img
 
 # Streamlit App
 def main():
@@ -705,8 +566,7 @@ def main():
         config = {
             'confidence_threshold': 0.5,
             'last_bag_timeout': 3.0,
-            'stable_frames': 5,
-            'source_type': 'synthetic'
+            'stable_frames': 5
         }
         st.session_state.agent = BagDetectionAgent(config)
     
@@ -720,14 +580,10 @@ def main():
     confidence_threshold = st.sidebar.slider("Confidence Threshold", 0.1, 1.0, 0.5)
     last_bag_timeout = st.sidebar.slider("Last Bag Timeout (sec)", 1, 10, 3)
     
-    st.sidebar.subheader("OCR Configuration")
-    ocr_engine = st.sidebar.selectbox("OCR Engine", ["paddle", "simulated"])
-    
     # Update agent config
     st.session_state.agent.config.update({
         'confidence_threshold': confidence_threshold,
-        'last_bag_timeout': last_bag_timeout,
-        'ocr_engine': ocr_engine
+        'last_bag_timeout': last_bag_timeout
     })
     
     # Main interface
@@ -760,16 +616,14 @@ def main():
         if st.session_state.processing:
             continue_processing = st.session_state.agent.process_single_frame()
             
-            if st.session_state.agent.current_frame is not None:
+            if st.session_state.agent.current_frame_data is not None:
                 # Draw visualization
-                display_frame = draw_pipeline_frame(
-                    st.session_state.agent.current_frame, 
+                display_img = draw_pipeline_frame(
+                    st.session_state.agent.current_frame_data, 
                     st.session_state.agent
                 )
                 
-                # Convert to RGB for display
-                display_frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                video_placeholder.image(display_frame_rgb, caption="Live Pipeline View", use_column_width=True)
+                video_placeholder.image(display_img, caption="Live Pipeline View", use_column_width=True)
             
             # Update status
             status = st.session_state.agent.get_status()
@@ -786,24 +640,19 @@ def main():
         
         else:
             # Show static state when not processing
-            if st.session_state.agent.current_frame is not None:
-                display_frame = draw_pipeline_frame(
-                    st.session_state.agent.current_frame, 
+            if st.session_state.agent.current_frame_data is not None:
+                display_img = draw_pipeline_frame(
+                    st.session_state.agent.current_frame_data, 
                     st.session_state.agent
                 )
-                display_frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                video_placeholder.image(display_frame_rgb, caption="Pipeline Ready", use_column_width=True)
+                video_placeholder.image(display_img, caption="Pipeline Ready", use_column_width=True)
             else:
                 # Generate initial frame
                 frame_data = st.session_state.agent.stapipy.get_frame()
                 if frame_data:
-                    st.session_state.agent.current_frame = frame_data['frame']
-                    display_frame = draw_pipeline_frame(
-                        st.session_state.agent.current_frame, 
-                        st.session_state.agent
-                    )
-                    display_frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                    video_placeholder.image(display_frame_rgb, caption="Pipeline Ready", use_column_width=True)
+                    st.session_state.agent.current_frame_data = frame_data
+                    display_img = draw_pipeline_frame(frame_data, st.session_state.agent)
+                    video_placeholder.image(display_img, caption="Pipeline Ready", use_column_width=True)
             
             status_placeholder.info("Click 'Start Pipeline' to begin processing")
     
@@ -840,7 +689,7 @@ def display_pipeline_status(status: Dict, placeholder):
             st.metric("Frames Processed", status['frames_processed'])
         with col2:
             st.metric("OCR Results", status['ocr_results'])
-            st.metric("Avg Processing Time", f"{status['avg_processing_time']*1000:.1f}ms")
+            st.metric("No Bag Frames", status['frames_without_bag'])
         
         # First/Last bag info
         if status['first_bag']:
@@ -870,14 +719,8 @@ def display_pipeline_statistics(agent: BagDetectionAgent):
         with col2:
             st.metric("State Changes", len(agent.state_history))
         with col3:
-            st.metric("No Bag Frames", status['frames_without_bag'])
-        
-        # Processing time distribution
-        if agent.processing_times:
-            fig = px.histogram(x=agent.processing_times, 
-                             title='Processing Time Distribution',
-                             labels={'x': 'Time (seconds)', 'y': 'Frequency'})
-            st.plotly_chart(fig, use_container_width=True)
+            avg_time = status['avg_processing_time'] * 1000
+            st.metric("Avg Time", f"{avg_time:.1f}ms")
     
     else:
         st.info("Start the pipeline to see statistics")
