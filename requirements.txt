@@ -5,3 +5,8 @@ Pillow
 pandas
 plotly
 altair
+ultralytics
+paddleocr
+torch
+torchvision
+streamlit-option-menu
