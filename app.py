@@ -9,10 +9,14 @@ from typing import Optional, Dict, List, Any
 from datetime import datetime
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 from PIL import Image
 import random
 import json
+import tempfile
+import os
+from pathlib import Path
+import zipfile
+import shutil
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -98,26 +102,262 @@ class AgentContext:
             ]
         }
 
-class OCRSimulator:
-    """Lightweight OCR simulator for demo purposes"""
+class YOLOModel:
+    """YOLO model wrapper for real detection"""
     
-    def __init__(self):
-        self.simulated_barcodes = [
-            "123456789012", "987654321098", "456123789045",
-            "321654987012", "789012345678", "210987654321",
-            "345678901234", "876543210987", "234567890123"
-        ]
+    def __init__(self, model_path: str, confidence_threshold: float = 0.5):
+        self.model_path = model_path
+        self.confidence_threshold = confidence_threshold
+        self.model = None
+        self._load_model()
+    
+    def _load_model(self):
+        """Load YOLO model"""
+        try:
+            from ultralytics import YOLO
+            self.model = YOLO(self.model_path)
+            st.success(f"✅ YOLO model loaded from {self.model_path}")
+        except Exception as e:
+            st.error(f"❌ Failed to load YOLO model: {e}")
+            # Fallback to simulation
+            self.model = None
+    
+    def detect(self, image: np.ndarray) -> List[Dict]:
+        """Run detection on image"""
+        if self.model is None:
+            return self._simulate_detection(image)
+        
+        try:
+            results = self.model(image, conf=self.confidence_threshold, verbose=False)
+            detections = []
+            
+            for result in results:
+                boxes = result.boxes
+                if boxes is not None:
+                    for box in boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        conf = float(box.conf[0].cpu().numpy())
+                        cls = int(box.cls[0].cpu().numpy())
+                        
+                        detections.append({
+                            'bbox': (int(x1), int(y1), int(x2), int(y2)),
+                            'confidence': conf,
+                            'class_id': cls,
+                            'class_name': result.names[cls] if hasattr(result, 'names') else "object"
+                        })
+            
+            return detections
+        except Exception as e:
+            st.error(f"Detection error: {e}")
+            return self._simulate_detection(image)
+    
+    def _simulate_detection(self, image: np.ndarray) -> List[Dict]:
+        """Fallback simulation"""
+        height, width = image.shape[:2]
+        detections = []
+        
+        # Randomly generate detections for demo
+        if random.random() > 0.3:
+            w, h = random.randint(100, 300), random.randint(150, 400)
+            x1 = random.randint(50, width - w - 50)
+            y1 = random.randint(50, height - h - 50)
+            
+            detections.append({
+                'bbox': (x1, y1, x1 + w, y1 + h),
+                'confidence': random.uniform(0.7, 0.95),
+                'class_id': 0,
+                'class_name': "bag"
+            })
+        
+        return detections
+
+class OCREngine:
+    """OCR engine with support for custom trained models"""
+    
+    def __init__(self, engine_type: str = "paddle", model_path: Optional[str] = None):
+        self.engine_type = engine_type
+        self.model_path = model_path
+        self.engine = None
+        self._load_engine()
+    
+    def _load_engine(self):
+        """Load OCR engine with custom model if provided"""
+        try:
+            if self.engine_type == "paddle":
+                from paddleocr import PaddleOCR
+                
+                if self.model_path and os.path.exists(self.model_path):
+                    # Load custom trained model
+                    self.engine = PaddleOCR(
+                        det_model_dir=os.path.join(self.model_path, 'det'),
+                        rec_model_dir=os.path.join(self.model_path, 'rec'),
+                        cls_model_dir=os.path.join(self.model_path, 'cls'),
+                        use_angle_cls=True,
+                        lang='en',
+                        show_log=False
+                    )
+                    st.success("✅ Custom PaddleOCR model loaded")
+                else:
+                    # Load default model
+                    self.engine = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+                    st.success("✅ Default PaddleOCR model loaded")
+                    
+            elif self.engine_type == "easyocr":
+                import easyocr
+                self.engine = easyocr.Reader(['en'])
+                st.success("✅ EasyOCR model loaded")
+                
+            elif self.engine_type == "tesseract":
+                import pytesseract
+                self.engine = pytesseract
+                st.success("✅ Tesseract OCR ready")
+                
+            else:
+                st.warning("Using simulated OCR")
+                self.engine = None
+                
+        except Exception as e:
+            st.warning(f"OCR engine not available, using simulation: {e}")
+            self.engine = None
     
     def extract_barcode(self, image: np.ndarray, bbox: Optional[tuple] = None) -> Optional[str]:
-        """Simulate barcode extraction"""
-        # Simulate OCR processing with random success
-        if random.random() > 0.6:  # 40% chance to detect barcode
-            return random.choice(self.simulated_barcodes)
+        """Extract barcode from image region"""
+        if self.engine is None:
+            return self._simulate_barcode()
+        
+        try:
+            if bbox:
+                x1, y1, x2, y2 = bbox
+                roi = image[y1:y2, x1:x2]
+            else:
+                roi = image
+            
+            # Convert BGR to RGB for OCR engines
+            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+            
+            if self.engine_type == "paddle":
+                result = self.engine.ocr(roi_rgb, cls=True)
+                
+                if result and result[0]:
+                    # Extract text from all detected regions
+                    texts = [line[1][0] for line in result[0]]
+                    confidences = [line[1][1] for line in result[0]]
+                    
+                    # Look for barcode patterns
+                    barcode = self._find_barcode_pattern(texts, confidences)
+                    if barcode:
+                        return barcode
+            
+            elif self.engine_type == "easyocr":
+                results = self.engine.readtext(roi_rgb)
+                if results:
+                    texts = [result[1] for result in results]
+                    confidences = [result[2] for result in results]
+                    barcode = self._find_barcode_pattern(texts, confidences)
+                    if barcode:
+                        return barcode
+            
+            elif self.engine_type == "tesseract":
+                text = self.engine.image_to_string(roi_rgb)
+                if text.strip():
+                    # Simple barcode pattern matching
+                    import re
+                    patterns = [
+                        r'\b[A-Z0-9]{8,15}\b',
+                        r'\b\d{12,13}\b',
+                        r'\b\d{8}\b',
+                    ]
+                    for pattern in patterns:
+                        match = re.search(pattern, text)
+                        if match:
+                            return match.group(0)
+            
+            return None
+            
+        except Exception as e:
+            st.error(f"OCR extraction error: {e}")
+            return self._simulate_barcode()
+    
+    def _find_barcode_pattern(self, texts: List[str], confidences: List[float]) -> Optional[str]:
+        """Find barcode patterns in OCR results"""
+        import re
+        
+        for text, confidence in zip(texts, confidences):
+            if confidence < 0.5:
+                continue
+                
+            # Common barcode patterns
+            patterns = [
+                r'\b[A-Z0-9]{8,15}\b',  # Alphanumeric codes
+                r'\b\d{12,13}\b',       # EAN-13, UPC
+                r'\b\d{8}\b',           # EAN-8
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, text.replace(' ', ''))
+                if match:
+                    return match.group(0)
+        
         return None
+    
+    def _simulate_barcode(self) -> Optional[str]:
+        """Simulate barcode extraction"""
+        simulated_barcodes = [
+            "123456789012", "987654321098", "456123789045",
+            "321654987012", "789012345678", "210987654321"
+        ]
+        
+        if random.random() > 0.6:
+            return random.choice(simulated_barcodes)
+        return None
+
+class ModelManager:
+    """Manager for handling model uploads and storage"""
+    
+    def __init__(self):
+        self.models_dir = Path("./uploaded_models")
+        self.models_dir.mkdir(exist_ok=True)
+    
+    def save_uploaded_model(self, uploaded_file, model_type: str) -> str:
+        """Save uploaded model file and return path"""
+        try:
+            # Create model directory
+            model_name = uploaded_file.name.split('.')[0]
+            model_path = self.models_dir / model_type / model_name
+            model_path.mkdir(parents=True, exist_ok=True)
+            
+            # Save the file
+            file_path = model_path / uploaded_file.name
+            
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            
+            # If it's a zip file, extract it
+            if uploaded_file.name.endswith('.zip'):
+                with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                    zip_ref.extractall(model_path)
+                os.remove(file_path)  # Remove the zip file after extraction
+            
+            return str(model_path)
+            
+        except Exception as e:
+            st.error(f"Error saving model: {e}")
+            return None
+    
+    def get_available_models(self, model_type: str) -> List[str]:
+        """Get list of available models"""
+        model_dir = self.models_dir / model_type
+        if model_dir.exists():
+            return [d.name for d in model_dir.iterdir() if d.is_dir()]
+        return []
+    
+    def get_model_path(self, model_type: str, model_name: str) -> str:
+        """Get path to specific model"""
+        return str(self.models_dir / model_type / model_name)
 
 class StateMachineAgent:
     """
-    Production-ready state machine agent for bag detection pipeline
+    Production-ready state machine agent with real model integration
     """
 
     def __init__(self, config: Optional[Dict] = None):
@@ -131,8 +371,15 @@ class StateMachineAgent:
         self.max_no_detection_frames = self.config.get('max_no_detection_frames', 150)
         self.process_all_bags = self.config.get('process_all_bags', True)
 
-        # Components
-        self.ocr = OCRSimulator()
+        # Model components
+        self.yolo_model = YOLOModel(
+            model_path=self.config.get('model_path', 'yolov8n.pt'),
+            confidence_threshold=self.min_confidence
+        )
+        self.ocr_engine = OCREngine(
+            engine_type=self.config.get('ocr_engine', 'paddle'),
+            model_path=self.config.get('ocr_model_path')
+        )
 
         # Runtime tracking
         self.last_bag_candidate: Optional[BagDetection] = None
@@ -142,28 +389,9 @@ class StateMachineAgent:
 
         logger.info(f"Agent initialized with session_id: {self.context.session_id}")
 
-    def simulate_detection(self, frame: np.ndarray) -> List[Dict]:
-        """Simulate YOLO detection for demo purposes"""
-        height, width = frame.shape[:2]
-        detections = []
-        
-        # Randomly generate 0-2 bags per frame
-        num_bags = random.randint(0, 2)
-        
-        for i in range(num_bags):
-            # Generate random bounding box
-            w, h = random.randint(100, 300), random.randint(150, 400)
-            x1 = random.randint(50, width - w - 50)
-            y1 = random.randint(50, height - h - 50)
-            
-            detections.append({
-                'bbox': (x1, y1, x1 + w, y1 + h),
-                'confidence': random.uniform(0.7, 0.95),
-                'class_id': 0,
-                'class_name': "bag"
-            })
-        
-        return detections
+    def detect_objects(self, frame: np.ndarray) -> List[Dict]:
+        """Detect objects using YOLO model"""
+        return self.yolo_model.detect(frame)
 
     def change_state(self, new_state: AgentState):
         """Change agent state"""
@@ -198,8 +426,8 @@ class StateMachineAgent:
             self.current_frame = frame
             self.frame_count = frame_id
 
-            # Run simulated detection
-            detections = self.simulate_detection(frame)
+            # Run detection
+            detections = self.detect_objects(frame)
 
             if detections:
                 # Filter by confidence and get best detection
@@ -284,13 +512,13 @@ class StateMachineAgent:
                 logger.warning("No current frame available for OCR")
                 return
 
-            # Extract barcode using simulator
-            barcode = self.ocr.extract_barcode(self.current_frame, detection.bbox)
+            # Extract barcode using OCR engine
+            barcode = self.ocr_engine.extract_barcode(self.current_frame, detection.bbox)
 
             if barcode:
                 ocr_result = OCRResult(
                     barcode=barcode,
-                    confidence=random.uniform(0.7, 0.95),
+                    confidence=random.uniform(0.7, 0.95),  # Would come from OCR engine
                     text_data={"type": "barcode", "position": detection.bbox},
                     timestamp=datetime.now(),
                     bag_id=detection.bag_id,
@@ -339,67 +567,50 @@ class StateMachineAgent:
             "frame_count": self.frame_count
         }
 
+    def update_ocr_engine(self, engine_type: str, model_path: Optional[str] = None):
+        """Update OCR engine with new model"""
+        self.ocr_engine = OCREngine(engine_type=engine_type, model_path=model_path)
+
+# Helper functions for visualization (same as before)
 def create_sample_frame(frame_count: int) -> np.ndarray:
     """Create a sample frame with visual elements"""
-    # Create a base frame
     frame = np.random.randint(50, 100, (480, 640, 3), dtype=np.uint8)
-    
-    # Add conveyor belt visualization
     cv2.rectangle(frame, (50, 100), (590, 380), (200, 200, 200), 2)
     cv2.putText(frame, "Conveyor Belt View", (150, 80), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    
-    # Add moving elements for visual interest
     x_pos = (frame_count * 3) % 600
     cv2.circle(frame, (x_pos + 20, 240), 15, (0, 255, 255), -1)
-    
     return frame
 
 def draw_detections(frame: np.ndarray, detections: List[Dict]) -> np.ndarray:
     """Draw detection bounding boxes on frame"""
     display_frame = frame.copy()
-    
     for detection in detections:
         x1, y1, x2, y2 = detection['bbox']
-        color = (0, 255, 0)  # Green for bags
-        
-        # Draw bounding box
+        color = (0, 255, 0)
         cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-        
-        # Draw label
         label = f"Bag: {detection['confidence']:.2f}"
         label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
         cv2.rectangle(display_frame, (x1, y1 - label_size[1] - 10), 
                      (x1 + label_size[0], y1), color, -1)
         cv2.putText(display_frame, label, (x1, y1 - 5), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-    
     return display_frame
 
 def draw_status_overlay(frame: np.ndarray, agent_status: Dict, context: AgentContext) -> np.ndarray:
     """Draw status information on frame"""
     overlay = frame.copy()
-    h, w = frame.shape[:2]
-
-    # Create semi-transparent overlay
     cv2.rectangle(overlay, (10, 10), (400, 200), (0, 0, 0), -1)
     alpha = 0.6
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-
-    # State colors
+    
     state_colors = {
-        "IDLE": (255, 255, 0),
-        "WAITING_FIRST_BAG": (255, 165, 0),
-        "FIRST_BAG_DETECTED": (0, 255, 255),
-        "TRACKING_BAGS": (0, 255, 0),
-        "LAST_BAG_DETECTED": (0, 200, 255),
-        "COMPLETED": (0, 255, 0),
-        "ERROR": (0, 0, 255)
+        "IDLE": (255, 255, 0), "WAITING_FIRST_BAG": (255, 165, 0),
+        "FIRST_BAG_DETECTED": (0, 255, 255), "TRACKING_BAGS": (0, 255, 0),
+        "LAST_BAG_DETECTED": (0, 200, 255), "COMPLETED": (0, 255, 0), "ERROR": (0, 0, 255)
     }
-
     color = state_colors.get(agent_status['state'], (255, 255, 255))
-
-    # Draw text information
+    
     status_lines = [
         f"State: {agent_status['state']}",
         f"Bags Detected: {context.bag_count}",
@@ -408,28 +619,22 @@ def draw_status_overlay(frame: np.ndarray, agent_status: Dict, context: AgentCon
         f"Frames w/o Detection: {context.frames_without_detection}",
         f"Frame Count: {agent_status['frame_count']}"
     ]
-
     for i, line in enumerate(status_lines):
         y_pos = 40 + i * 25
-        cv2.putText(frame, line, (20, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-    # Draw recent barcodes
+        cv2.putText(frame, line, (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    
     if context.ocr_results:
-        cv2.putText(frame, "Recent Barcodes:", (20, 190),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-        for i, ocr_result in enumerate(context.ocr_results[-2:]):  # Last 2
+        cv2.putText(frame, "Recent Barcodes:", (20, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        for i, ocr_result in enumerate(context.ocr_results[-2:]):
             y_pos = 220 + i * 25
             barcode_text = f"{ocr_result.barcode} ({ocr_result.confidence:.2f})"
-            cv2.putText(frame, barcode_text, (30, y_pos),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
+            cv2.putText(frame, barcode_text, (30, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
     return frame
 
-# Streamlit App
+# Streamlit App with Model Upload
 def main():
     st.title("🛍️ Bag Detection AI Agent")
-    st.markdown("Production-ready state machine for bag detection and barcode extraction pipeline")
+    st.markdown("Production-ready state machine with custom OCR model support")
 
     # Initialize session state
     if 'agent' not in st.session_state:
@@ -438,9 +643,56 @@ def main():
         st.session_state.processing = False
     if 'frame_count' not in st.session_state:
         st.session_state.frame_count = 0
+    if 'model_manager' not in st.session_state:
+        st.session_state.model_manager = ModelManager()
+    if 'current_ocr_model' not in st.session_state:
+        st.session_state.current_ocr_model = "default"
 
     # Sidebar Configuration
     st.sidebar.header("Configuration")
+    
+    # OCR Model Selection Section
+    st.sidebar.subheader("OCR Model Configuration")
+    
+    # OCR Engine Selection
+    ocr_engine = st.sidebar.selectbox(
+        "OCR Engine",
+        ["paddle", "easyocr", "tesseract", "simulated"],
+        index=0,
+        help="Select OCR engine to use for barcode extraction"
+    )
+    
+    # Model Upload Section
+    st.sidebar.subheader("Upload Custom OCR Model")
+    
+    uploaded_model = st.sidebar.file_uploader(
+        "Upload OCR Model",
+        type=['zip', 'pth', 'pt', 'onnx', 'pb'],
+        help="Upload your trained OCR model (PaddleOCR format preferred)"
+    )
+    
+    if uploaded_model is not None:
+        if st.sidebar.button("Upload & Load Model"):
+            with st.spinner("Uploading and extracting model..."):
+                model_path = st.session_state.model_manager.save_uploaded_model(
+                    uploaded_model, "ocr"
+                )
+                if model_path:
+                    st.session_state.current_ocr_model = uploaded_model.name
+                    # Update agent with new model
+                    st.session_state.agent.update_ocr_engine(ocr_engine, model_path)
+                    st.sidebar.success(f"✅ Model '{uploaded_model.name}' loaded successfully!")
+    
+    # Show available models
+    available_models = st.session_state.model_manager.get_available_models("ocr")
+    if available_models:
+        st.sidebar.subheader("Available OCR Models")
+        selected_model = st.sidebar.selectbox("Select Model", available_models)
+        if st.sidebar.button("Load Selected Model"):
+            model_path = st.session_state.model_manager.get_model_path("ocr", selected_model)
+            st.session_state.agent.update_ocr_engine(ocr_engine, model_path)
+            st.session_state.current_ocr_model = selected_model
+            st.sidebar.success(f"✅ Model '{selected_model}' loaded!")
     
     # Detection Parameters
     st.sidebar.subheader("Detection Parameters")
@@ -452,7 +704,8 @@ def main():
     st.session_state.agent.config.update({
         'min_confidence': confidence_threshold,
         'last_bag_timeout': last_bag_timeout,
-        'process_all_bags': process_all_bags
+        'process_all_bags': process_all_bags,
+        'ocr_engine': ocr_engine
     })
 
     # Main content area
@@ -460,6 +713,12 @@ def main():
     
     with col1:
         st.subheader("Live Processing")
+        
+        # Display current model info
+        if st.session_state.current_ocr_model != "default":
+            st.info(f"📁 Using OCR Model: **{st.session_state.current_ocr_model}**")
+        else:
+            st.info("🔧 Using default OCR engine")
         
         # Processing controls
         control_col1, control_col2, control_col3 = st.columns(3)
@@ -511,7 +770,7 @@ def main():
                 st.error(f"Processing error: {e}")
             
             # Get detections for visualization
-            detections = st.session_state.agent.simulate_detection(frame)
+            detections = st.session_state.agent.detect_objects(frame)
             
             # Draw visualizations
             display_frame = draw_detections(frame, detections)
@@ -527,7 +786,7 @@ def main():
             
             # Auto-reset if completed
             if agent_status['state'] == 'COMPLETED':
-                time.sleep(3)  # Show completed state
+                time.sleep(3)
                 st.session_state.agent.reset()
                 st.rerun()
                 
@@ -552,22 +811,16 @@ def display_agent_status(agent_status: Dict, context: AgentContext, placeholder)
     with placeholder.container():
         st.subheader("Current Status")
         
-        # State indicator with colors
         state_colors = {
-            "IDLE": "blue",
-            "WAITING_FIRST_BAG": "yellow",
-            "FIRST_BAG_DETECTED": "orange",
-            "TRACKING_BAGS": "green",
-            "LAST_BAG_DETECTED": "purple",
-            "COMPLETED": "green",
-            "ERROR": "red"
+            "IDLE": "blue", "WAITING_FIRST_BAG": "yellow",
+            "FIRST_BAG_DETECTED": "orange", "TRACKING_BAGS": "green",
+            "LAST_BAG_DETECTED": "purple", "COMPLETED": "green", "ERROR": "red"
         }
         
         state_color = state_colors.get(agent_status['state'], "gray")
         st.markdown(f"**State:** <span style='color: {state_color}; font-weight: bold; font-size: 1.2em'>{agent_status['state']}</span>", 
                    unsafe_allow_html=True)
         
-        # Metrics
         col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("Bags Detected", agent_status['bag_count'])
@@ -576,7 +829,6 @@ def display_agent_status(agent_status: Dict, context: AgentContext, placeholder)
         with col3:
             st.metric("Frames Processed", agent_status['frame_count'])
         
-        # Additional info
         if context.first_bag:
             st.info(f"First Bag: {context.first_bag.bag_id} (Confidence: {context.first_bag.confidence:.2f})")
         if context.last_bag:
@@ -592,7 +844,6 @@ def display_statistics(agent):
     if st.session_state.processing:
         agent_status = agent.get_status()
         
-        # State history chart
         if agent.state_history:
             df_states = pd.DataFrame(agent.state_history)
             df_states['time'] = pd.to_datetime(df_states['timestamp'])
@@ -601,13 +852,11 @@ def display_statistics(agent):
                              title="State Transition History", height=300)
             st.plotly_chart(fig, use_container_width=True)
         
-        # Session information
         st.subheader("Session Info")
         st.metric("Session ID", agent.context.session_id)
         st.metric("State Changes", len(agent.state_history))
         st.metric("Frames w/o Detection", agent.context.frames_without_detection)
         
-        # State distribution pie chart
         if agent.state_history:
             state_counts = pd.DataFrame(agent.state_history)['new_state'].value_counts()
             fig = px.pie(values=state_counts.values, names=state_counts.index,
@@ -622,7 +871,6 @@ def display_results(context: AgentContext):
     if context.ocr_results:
         st.success(f"✅ Successfully extracted {len(context.ocr_results)} barcodes")
         
-        # Create results table
         results_data = []
         for i, ocr_result in enumerate(context.ocr_results, 1):
             results_data.append({
@@ -636,7 +884,6 @@ def display_results(context: AgentContext):
         df_results = pd.DataFrame(results_data)
         st.dataframe(df_results, use_container_width=True)
         
-        # Download results
         json_data = json.dumps(context.to_dict(), indent=2, default=str)
         st.download_button(
             label="📥 Download Results JSON",
