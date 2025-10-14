@@ -1,7 +1,6 @@
 import streamlit as st
-import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import pytesseract
 import tempfile
 import os
@@ -9,6 +8,7 @@ from pathlib import Path
 import re
 import json
 from datetime import datetime
+import io
 
 # Set page config
 st.set_page_config(
@@ -18,13 +18,12 @@ st.set_page_config(
 )
 
 class OCREngine:
-    """OCR Engine with multiple backends and model upload support"""
+    """OCR Engine with model upload support - No OpenCV"""
     
     def __init__(self):
         self.engine_type = "pytesseract"
         self.custom_model_loaded = False
         self.model_path = None
-        self.engine = None
         
     def load_custom_model(self, uploaded_file, engine_type: str):
         """Load custom OCR model"""
@@ -37,36 +36,15 @@ class OCREngine:
             self.engine_type = engine_type
             self.custom_model_loaded = True
             
-            # Initialize engine based on type
-            if engine_type == "pytesseract":
-                # For Tesseract, we just note the custom model path
-                st.success(f"✅ Custom Tesseract model loaded: {uploaded_file.name}")
-                
-            elif engine_type == "paddleocr":
-                try:
-                    from paddleocr import PaddleOCR
-                    # Load custom PaddleOCR model
-                    self.engine = PaddleOCR(
-                        det_model_dir=self.model_path if 'det' in uploaded_file.name else None,
-                        rec_model_dir=self.model_path if 'rec' in uploaded_file.name else None,
-                        cls_model_dir=self.model_path if 'cls' in uploaded_file.name else None,
-                        use_angle_cls=True,
-                        lang='en',
-                        show_log=False
-                    )
-                    st.success(f"✅ Custom PaddleOCR model loaded: {uploaded_file.name}")
-                except ImportError:
-                    st.warning("PaddleOCR not available, using pytesseract")
-                    self.engine_type = "pytesseract"
-            
+            st.success(f"✅ Custom model loaded: {uploaded_file.name}")
             return True
             
         except Exception as e:
             st.error(f"❌ Error loading model: {e}")
             return False
     
-    def extract_barcodes(self, image: np.ndarray) -> dict:
-        """Extract barcodes from image using selected OCR engine"""
+    def extract_barcodes(self, image: Image.Image) -> dict:
+        """Extract barcodes from image using OCR"""
         results = {
             'barcodes': [],
             'text_blocks': [],
@@ -76,30 +54,18 @@ class OCREngine:
         }
         
         try:
-            if self.engine_type == "pytesseract":
-                return self._extract_with_tesseract(image, results)
-            elif self.engine_type == "paddleocr" and self.engine:
-                return self._extract_with_paddleocr(image, results)
-            else:
-                return self._extract_with_tesseract(image, results)
-                
+            return self._extract_with_tesseract(image, results)
         except Exception as e:
             st.error(f"OCR extraction error: {e}")
             return results
     
-    def _extract_with_tesseract(self, image: np.ndarray, results: dict) -> dict:
+    def _extract_with_tesseract(self, image: Image.Image, results: dict) -> dict:
         """Extract using Tesseract OCR"""
-        # Convert to RGB if needed
-        if len(image.shape) == 3 and image.shape[2] == 3:
-            pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-        else:
-            pil_image = Image.fromarray(image)
-        
         # Configure Tesseract for barcode detection
         custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
         
-        # Extract text
-        text_data = pytesseract.image_to_data(pil_image, output_type=pytesseract.Output.DICT, config=custom_config)
+        # Extract text with bounding boxes
+        text_data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config=custom_config)
         
         # Process results
         barcodes = []
@@ -109,15 +75,17 @@ class OCREngine:
             if text.strip():
                 confidence = float(text_data['conf'][i]) / 100.0
                 if confidence > 0.1:  # Filter low confidence results
+                    bbox = (
+                        text_data['left'][i],
+                        text_data['top'][i],
+                        text_data['left'][i] + text_data['width'][i],
+                        text_data['top'][i] + text_data['height'][i]
+                    )
+                    
                     text_blocks.append({
                         'text': text.strip(),
                         'confidence': confidence,
-                        'bbox': (
-                            text_data['left'][i],
-                            text_data['top'][i],
-                            text_data['left'][i] + text_data['width'][i],
-                            text_data['top'][i] + text_data['height'][i]
-                        )
+                        'bbox': bbox
                     })
                     
                     # Check if text matches barcode patterns
@@ -127,57 +95,8 @@ class OCREngine:
                             'barcode': barcode,
                             'confidence': confidence,
                             'source_text': text,
-                            'bbox': (
-                                text_data['left'][i],
-                                text_data['top'][i],
-                                text_data['left'][i] + text_data['width'][i],
-                                text_data['top'][i] + text_data['height'][i]
-                            )
+                            'bbox': bbox
                         })
-        
-        results['barcodes'] = barcodes
-        results['text_blocks'] = text_blocks
-        results['confidence'] = max([b['confidence'] for b in barcodes]) if barcodes else 0.0
-        
-        return results
-    
-    def _extract_with_paddleocr(self, image: np.ndarray, results: dict) -> dict:
-        """Extract using PaddleOCR"""
-        # Convert BGR to RGB for PaddleOCR
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # Run OCR
-        ocr_result = self.engine.ocr(rgb_image, cls=True)
-        
-        barcodes = []
-        text_blocks = []
-        
-        if ocr_result and ocr_result[0]:
-            for line in ocr_result[0]:
-                if line and len(line) >= 2:
-                    text = line[1][0]
-                    confidence = float(line[1][1])
-                    
-                    if text.strip():
-                        # Get bounding box
-                        bbox = line[0]
-                        flat_bbox = [coord for point in bbox for coord in point]
-                        
-                        text_blocks.append({
-                            'text': text.strip(),
-                            'confidence': confidence,
-                            'bbox': tuple(flat_bbox)
-                        })
-                        
-                        # Check for barcode patterns
-                        barcode = self._extract_barcode_pattern(text)
-                        if barcode:
-                            barcodes.append({
-                                'barcode': barcode,
-                                'confidence': confidence,
-                                'source_text': text,
-                                'bbox': tuple(flat_bbox)
-                            })
         
         results['barcodes'] = barcodes
         results['text_blocks'] = text_blocks
@@ -206,50 +125,68 @@ class OCREngine:
         
         return ""
 
-def preprocess_image(image: np.ndarray) -> np.ndarray:
-    """Preprocess image for better OCR results"""
+def preprocess_image(image: Image.Image) -> Image.Image:
+    """Preprocess image for better OCR results - Pure PIL"""
     # Convert to grayscale
-    if len(image.shape) == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image
+    if image.mode != 'L':
+        image = image.convert('L')
     
-    # Apply noise reduction
-    denoised = cv2.medianBlur(gray, 3)
+    # Enhance contrast (simple histogram stretch)
+    from PIL import ImageEnhance
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(2.0)  # Increase contrast
     
-    # Apply thresholding
-    _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Sharpen image
+    enhancer = ImageEnhance.Sharpness(image)
+    image = enhancer.enhance(2.0)
     
-    # Apply morphological operations to clean up image
-    kernel = np.ones((2, 2), np.uint8)
-    processed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-    
-    return processed
+    return image
 
-def draw_ocr_results(image: np.ndarray, ocr_results: dict) -> np.ndarray:
-    """Draw OCR results on image"""
-    display_image = image.copy()
+def draw_ocr_results(image: Image.Image, ocr_results: dict) -> Image.Image:
+    """Draw OCR results on image - Pure PIL"""
+    # Create a copy to draw on
+    draw_image = image.copy()
+    draw = ImageDraw.Draw(draw_image)
     
-    # Draw bounding boxes for all text blocks
+    try:
+        # Try to load a font, fallback to default
+        font = ImageFont.load_default()
+        # For larger text, we'll use a built-in font
+        large_font = ImageFont.load_default()
+    except:
+        font = None
+        large_font = None
+    
+    # Draw bounding boxes for all text blocks (green)
     for block in ocr_results['text_blocks']:
         bbox = block['bbox']
         if len(bbox) >= 4:
-            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-            cv2.rectangle(display_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            x1, y1, x2, y2 = bbox
+            draw.rectangle([x1, y1, x2, y2], outline='green', width=2)
     
     # Draw barcode bounding boxes in red
     for barcode in ocr_results['barcodes']:
         bbox = barcode['bbox']
         if len(bbox) >= 4:
-            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-            cv2.rectangle(display_image, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            x1, y1, x2, y2 = bbox
             
-            # Draw barcode text
+            # Draw red bounding box
+            draw.rectangle([x1, y1, x2, y2], outline='red', width=3)
+            
+            # Draw barcode text above the box
             label = f"Barcode: {barcode['barcode']}"
-            cv2.putText(display_image, label, (x1, y1 - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            text_bbox = draw.textbbox((0, 0), label, font=font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+            
+            # Draw text background
+            draw.rectangle([x1, y1 - text_height - 5, x1 + text_width + 10, y1], 
+                          fill='red')
+            
+            # Draw text
+            draw.text((x1 + 5, y1 - text_height - 2), label, fill='white', font=font)
     
-    return display_image
+    return draw_image
 
 def main():
     st.title("📄 OCR Barcode Extractor")
@@ -265,41 +202,42 @@ def main():
     # OCR Engine selection
     engine_type = st.sidebar.selectbox(
         "Select OCR Engine",
-        ["pytesseract", "paddleocr"],
+        ["pytesseract"],
         help="Choose OCR engine for barcode extraction"
     )
     
     # Custom model upload
-    st.sidebar.subheader("Upload Custom OCR Model")
+    st.sidebar.subheader("📁 Upload Custom OCR Model")
     uploaded_model = st.sidebar.file_uploader(
         "Upload trained OCR model",
-        type=['h5', 'pth', 'pt', 'onnx', 'pb', 'traineddata'],
-        help="Upload custom trained OCR model files"
+        type=['traineddata', 'h5', 'pth', 'pt', 'onnx'],
+        help="Upload custom trained OCR model files (Tesseract .traineddata recommended)"
     )
     
     if uploaded_model is not None:
-        if st.sidebar.button("Load Custom Model"):
+        if st.sidebar.button("🚀 Load Custom Model"):
             with st.spinner("Loading custom model..."):
                 success = st.session_state.ocr_engine.load_custom_model(uploaded_model, engine_type)
                 if success:
                     st.sidebar.success(f"Model loaded: {uploaded_model.name}")
     
-    # Model info
+    # Model info display
     if st.session_state.ocr_engine.custom_model_loaded:
-        st.sidebar.info(f"🔧 Using custom {engine_type} model")
+        st.sidebar.success(f"🔧 Custom model active: {st.session_state.ocr_engine.model_path}")
     else:
-        st.sidebar.info("🔧 Using default OCR engine")
+        st.sidebar.info("🔧 Using default Tesseract OCR")
     
     # Processing options
-    st.sidebar.subheader("Processing Options")
+    st.sidebar.subheader("⚙️ Processing Options")
     enable_preprocessing = st.sidebar.checkbox("Enable Image Preprocessing", value=True)
     show_text_blocks = st.sidebar.checkbox("Show All Text Blocks", value=False)
+    min_confidence = st.sidebar.slider("Minimum Confidence", 0.1, 1.0, 0.5)
     
     # Main content area
     col1, col2 = st.columns([1, 1])
     
     with col1:
-        st.subheader("Upload Images")
+        st.subheader("📤 Upload Images")
         
         # File uploader
         uploaded_files = st.file_uploader(
@@ -313,48 +251,47 @@ def main():
             st.success(f"📁 {len(uploaded_files)} image(s) uploaded")
             
             # Process all images
-            if st.button("🚀 Extract Barcodes from All Images", type="primary"):
-                process_multiple_images(uploaded_files, enable_preprocessing, show_text_blocks)
+            if st.button("🚀 Extract Barcodes from All Images", type="primary", use_container_width=True):
+                process_multiple_images(uploaded_files, enable_preprocessing, show_text_blocks, min_confidence)
         
         # Single image processing
         if uploaded_files and len(uploaded_files) == 1:
-            st.subheader("Single Image Preview")
-            process_single_image(uploaded_files[0], enable_preprocessing, show_text_blocks)
+            st.subheader("👀 Single Image Preview")
+            process_single_image(uploaded_files[0], enable_preprocessing, show_text_blocks, min_confidence)
     
     with col2:
-        st.subheader("Results & Export")
+        st.subheader("📊 Results & Export")
         
         # Display results from session state
         if 'ocr_results' in st.session_state:
             display_results(st.session_state.ocr_results, show_text_blocks)
         else:
-            st.info("Upload images and click 'Extract Barcodes' to see results")
+            st.info("📝 Upload images and click 'Extract Barcodes' to see results")
 
-def process_single_image(uploaded_file, enable_preprocessing: bool, show_text_blocks: bool):
+def process_single_image(uploaded_file, enable_preprocessing: bool, show_text_blocks: bool, min_confidence: float):
     """Process a single uploaded image"""
     try:
         # Read image
         image = Image.open(uploaded_file)
-        image_np = np.array(image)
-        
-        # Convert to BGR if needed
-        if len(image_np.shape) == 3 and image_np.shape[2] == 3:
-            image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
         
         # Display original image
         st.image(image, caption="Original Image", use_column_width=True)
         
         # Preprocess if enabled
         if enable_preprocessing:
-            processed_image = preprocess_image(image_np)
+            processed_image = preprocess_image(image)
             st.image(processed_image, caption="Preprocessed Image", use_column_width=True)
             image_to_process = processed_image
         else:
-            image_to_process = image_np
+            image_to_process = image
         
         # Extract barcodes
-        with st.spinner("Extracting barcodes..."):
+        with st.spinner("🔍 Extracting barcodes..."):
             ocr_results = st.session_state.ocr_engine.extract_barcodes(image_to_process)
+        
+        # Filter by confidence
+        ocr_results['barcodes'] = [b for b in ocr_results['barcodes'] if b['confidence'] >= min_confidence]
+        ocr_results['text_blocks'] = [t for t in ocr_results['text_blocks'] if t['confidence'] >= min_confidence]
         
         # Store results
         st.session_state.ocr_results = {
@@ -364,12 +301,12 @@ def process_single_image(uploaded_file, enable_preprocessing: bool, show_text_bl
         }
         
         # Display results
-        display_single_results(ocr_results, image_np, show_text_blocks)
+        display_single_results(ocr_results, image, show_text_blocks)
         
     except Exception as e:
-        st.error(f"Error processing image: {e}")
+        st.error(f"❌ Error processing image: {e}")
 
-def process_multiple_images(uploaded_files, enable_preprocessing: bool, show_text_blocks: bool):
+def process_multiple_images(uploaded_files, enable_preprocessing: bool, show_text_blocks: bool, min_confidence: float):
     """Process multiple uploaded images"""
     all_results = {}
     
@@ -377,24 +314,23 @@ def process_multiple_images(uploaded_files, enable_preprocessing: bool, show_tex
     status_text = st.empty()
     
     for i, uploaded_file in enumerate(uploaded_files):
-        status_text.text(f"Processing {i+1}/{len(uploaded_files)}: {uploaded_file.name}")
+        status_text.text(f"🔄 Processing {i+1}/{len(uploaded_files)}: {uploaded_file.name}")
         
         try:
             # Read and process image
             image = Image.open(uploaded_file)
-            image_np = np.array(image)
-            
-            if len(image_np.shape) == 3 and image_np.shape[2] == 3:
-                image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
             
             # Preprocess if enabled
             if enable_preprocessing:
-                image_to_process = preprocess_image(image_np)
+                image_to_process = preprocess_image(image)
             else:
-                image_to_process = image_np
+                image_to_process = image
             
             # Extract barcodes
             ocr_results = st.session_state.ocr_engine.extract_barcodes(image_to_process)
+            
+            # Filter by confidence
+            ocr_results['barcodes'] = [b for b in ocr_results['barcodes'] if b['confidence'] >= min_confidence]
             
             # Store results
             all_results[uploaded_file.name] = {
@@ -404,7 +340,7 @@ def process_multiple_images(uploaded_files, enable_preprocessing: bool, show_tex
             }
             
         except Exception as e:
-            st.error(f"Error processing {uploaded_file.name}: {e}")
+            st.error(f"❌ Error processing {uploaded_file.name}: {e}")
             all_results[uploaded_file.name] = {
                 'timestamp': datetime.now().isoformat(),
                 'error': str(e),
@@ -413,16 +349,16 @@ def process_multiple_images(uploaded_files, enable_preprocessing: bool, show_tex
         
         progress_bar.progress((i + 1) / len(uploaded_files))
     
-    status_text.text("Processing complete!")
+    status_text.text("✅ Processing complete!")
     st.session_state.ocr_results = all_results
     
     # Show summary
     total_barcodes = sum(result.get('barcodes_found', 0) for result in all_results.values())
     st.success(f"✅ Processed {len(uploaded_files)} images, found {total_barcodes} barcodes")
 
-def display_single_results(ocr_results: dict, original_image: np.ndarray, show_text_blocks: bool):
+def display_single_results(ocr_results: dict, original_image: Image.Image, show_text_blocks: bool):
     """Display results for a single image"""
-    st.subheader("Extraction Results")
+    st.subheader("📈 Extraction Results")
     
     # Barcodes found
     if ocr_results['barcodes']:
@@ -441,24 +377,69 @@ def display_single_results(ocr_results: dict, original_image: np.ndarray, show_t
         
         # Draw results on image
         result_image = draw_ocr_results(original_image, ocr_results)
-        result_image_rgb = cv2.cvtColor(result_image, cv2.COLOR_BGR2RGB)
-        st.image(result_image_rgb, caption="Barcode Detection Results", use_column_width=True)
+        st.image(result_image, caption="Barcode Detection Results", use_column_width=True)
+        
+        # Export single results
+        export_single_results(ocr_results, original_image)
     
     else:
         st.warning("❌ No barcodes found")
     
     # Show all text blocks if requested
     if show_text_blocks and ocr_results['text_blocks']:
-        st.subheader("All Detected Text Blocks")
+        st.subheader("📝 All Detected Text Blocks")
         text_data = []
         for block in ocr_results['text_blocks']:
+            is_barcode = any(b['source_text'] == block['text'] for b in ocr_results['barcodes'])
             text_data.append({
                 'Text': block['text'],
                 'Confidence': f"{block['confidence']:.2%}",
-                'Is Barcode': '✅' if any(b['source_text'] == block['text'] for b in ocr_results['barcodes']) else '❌'
+                'Is Barcode': '✅' if is_barcode else '❌'
             })
         
         st.table(text_data)
+
+def export_single_results(ocr_results: dict, image: Image.Image):
+    """Export single image results"""
+    st.subheader("📥 Export Results")
+    
+    # JSON export
+    export_data = {
+        'export_timestamp': datetime.now().isoformat(),
+        'ocr_engine': ocr_results['engine_used'],
+        'custom_model_used': ocr_results['custom_model'],
+        'barcodes_found': len(ocr_results['barcodes']),
+        'barcodes': ocr_results['barcodes'],
+        'text_blocks': ocr_results['text_blocks'] if st.session_state.get('show_text_blocks', False) else []
+    }
+    
+    json_str = json.dumps(export_data, indent=2)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.download_button(
+            label="📄 Download JSON Results",
+            data=json_str,
+            file_name=f"barcode_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            use_container_width=True
+        )
+    
+    with col2:
+        # Save annotated image
+        if ocr_results['barcodes']:
+            annotated_image = draw_ocr_results(image, ocr_results)
+            img_buffer = io.BytesIO()
+            annotated_image.save(img_buffer, format='PNG')
+            
+            st.download_button(
+                label="🖼️ Download Annotated Image",
+                data=img_buffer.getvalue(),
+                file_name=f"annotated_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                mime="image/png",
+                use_container_width=True
+            )
 
 def display_results(all_results: dict, show_text_blocks: bool):
     """Display results for multiple images"""
@@ -467,7 +448,7 @@ def display_results(all_results: dict, show_text_blocks: bool):
         display_single_results(all_results['results'], None, show_text_blocks)
     else:
         # Multiple image results
-        st.subheader("Batch Processing Results")
+        st.subheader("📊 Batch Processing Results")
         
         # Summary table
         summary_data = []
@@ -486,25 +467,28 @@ def display_results(all_results: dict, show_text_blocks: bool):
         
         st.table(summary_data)
         
-        # Export results
-        if st.button("📥 Export All Results as JSON"):
+        # Export all results
+        if st.button("📦 Export All Results as JSON", use_container_width=True):
             export_data = {
                 'export_timestamp': datetime.now().isoformat(),
                 'ocr_engine': st.session_state.ocr_engine.engine_type,
                 'custom_model_used': st.session_state.ocr_engine.custom_model_loaded,
+                'total_images': len(all_results),
+                'total_barcodes': total_barcodes,
                 'results': all_results
             }
             
             json_str = json.dumps(export_data, indent=2)
             st.download_button(
-                label="Download JSON",
+                label="📥 Download Complete Results",
                 data=json_str,
-                file_name=f"barcode_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json"
+                file_name=f"batch_barcode_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True
             )
         
         # Show detailed results for each file
-        st.subheader("Detailed Results")
+        st.subheader("🔍 Detailed Results")
         selected_file = st.selectbox("Select file to view details:", list(all_results.keys()))
         
         if selected_file:
