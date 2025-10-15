@@ -11,6 +11,25 @@ from datetime import datetime
 import io
 import zipfile
 
+# Add YOLO import with error handling
+try:
+    from ultralytics import YOLO
+except ImportError:
+    st.error("❌ Ultralytics not installed. Please run: pip install ultralytics")
+    st.stop()
+
+# Set page config
+st.set_page_config(
+    page_title="YOLO OCR Barcode Extractor",
+    page_icon="📸",
+    layout="wide"
+)
+
+# Main app
+st.title("YOLO OCR Barcode Extractor")
+st.markdown("Upload YOLO models (.pt) and images for barcode detection - No OpenCV Required")
+
+
 # Set page config
 st.set_page_config(
     page_title="YOLO OCR Barcode Extractor",
