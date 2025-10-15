@@ -11,12 +11,6 @@ from datetime import datetime
 import io
 import zipfile
 
-# Add YOLO import with error handling
-try:
-    from ultralytics import YOLO
-except ImportError:
-    st.error("❌ Ultralytics not installed. Please run: pip install ultralytics")
-    st.stop()
 
 # Set page config
 st.set_page_config(
